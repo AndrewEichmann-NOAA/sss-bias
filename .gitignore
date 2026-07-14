@@ -1,0 +1,4 @@
+data/
+.DS_Store
+src/.venv/
+__pycache__/
