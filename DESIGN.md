@@ -195,12 +195,19 @@ Kept flat and script-based given the project's current size — no need for a pa
 ```
 src/
   process_netcdf_cycles.py   # existing cycle-walking utility (extend, don't fork)
-  build_matchups.py          # new: SMAP-Argo collocation -> matchup table (parquet)
-  train_baseline.py          # new: load matchup table, train + evaluate FFANN vs. baselines
-  features.py                # new: shared feature-engineering functions (cyclical time, etc.)
+  build_matchups.py          # SMAP/SMOS-Argo collocation -> matchup table (parquet), --sensor smap|smos
+  qc_diagnostics.py          # per-stage QC rejection rate diagnostics, --sensor smap|smos
+  features.py                # shared feature-engineering functions (cyclical time, split boundaries, etc.)
+  train_baseline.py          # load matchup table, train + evaluate FFANN vs. baselines, --sensor smap|smos
+  plot_geographic_errors.py  # global RMSE/bias maps, raw vs. FFANN-corrected
 data/
-  matchups/                  # new: output of build_matchups.py, gitignored (derived data)
+  matchups/                  # output of build_matchups.py / train_baseline.py, gitignored (derived data)
 ```
+
+**Update**: project directory renamed from `sss` to `sss-bias` (matching the conda env name) partway through
+this session; a git repository was initialized at the new root and pushed to
+`github.com/AndrewEichmann-NOAA/sss-bias` (private). `.gitignore` covers `data/`, `.DS_Store`, `src/.venv/`,
+`__pycache__/`. All hardcoded absolute paths in the scripts above were updated to match.
 
 ## 10. Roadmap
 
@@ -225,11 +232,13 @@ data/
   Argo obs and ~272M SMAP obs scanned. With the train/validate/test split in §6, that's roughly ~110k train /
   ~28k validate / ~28k test rows (exact split counts not yet computed) — enough for a small FFANN, though
   still worth watching for overfitting given only a handful of input features.
-- **New**: matchup density per SMAP cycle-file is not stable across years (~90/file in 2021, ~38/file in
-  2022, ~52/file in 2023) and doesn't track the number of available cycle-files proportionally. Not yet
-  explained — could be genuine (Argo float density changes, seasonal coverage) or a pipeline artifact worth
+- matchup density per SMAP cycle-file is not stable across years (~90/file in 2021, ~38/file in 2022,
+  ~52/file in 2023) and doesn't track the number of available cycle-files proportionally. Not yet explained —
+  could be genuine (Argo float density changes, seasonal coverage) or a pipeline artifact worth
   double-checking (e.g. was 2022 missing some months' worth of Argo data in the source tarball?) before
-  trusting per-year comparisons too far.
+  trusting per-year comparisons too far. **Update**: §14 found the real Argo GDAC is publicly accessible —
+  could cross-check obsForge's 2022 Argo coverage against the authoritative GDAC index directly if this
+  becomes worth resolving.
 - ~~PyTorch is not yet installed...~~ Resolved: project now uses the `sss-bias` conda environment
   (`/opt/miniconda3/envs/sss-bias`, Python 3.14) instead of `src/.venv`. Installed and verified: `torch`
   2.11.0, `scikit-learn` 1.9.0, `pyarrow` 25.0.0, `matplotlib` 3.11.0, on top of the env's existing `numpy`,
@@ -265,7 +274,10 @@ Two things to watch, not yet acted on:
   — both linear regression (bias -1.95) and the FFANN (bias -1.19) do *worse* than the raw/constant-bias
   baselines there, most likely overfitting to a handful of points rather than a real regional failure. Not
   worth tuning around until there's more data in that basin; flag rather than fix.
-- Need confirmation on where SST/wind/roughness will come from (blocks phases 2–3).
+- Need confirmation on where SST/wind/roughness will come from (blocks phases 2–3). **Update**: investigated
+  in §14 — raw SMAP/SMOS L2 granules that carry these fields are both credential-gated (NASA Earthdata,
+  CATDS), not self-serve. Still unresolved; blocks phase 2 until either credentials are obtained or another
+  source (e.g. GDAS atmosphere/ocean background fields) is identified.
 
 ### 12.1 SMOS comparison
 
@@ -342,7 +354,128 @@ Findings:
 - **New concern**: the FFANN-corrected bias map shows a systematic negative-bias band across the
   tropics/subtropics (~30S-30N) for both sensors that is much weaker in the raw data. The aggregate test-set
   bias looked near-zero (+0.05 PSU) because this negative band is being canceled out by opposite-signed error
-  elsewhere -- the aggregate metric was masking a real regional pattern. Plausibly connected to the same
-  train/test distribution-shift signal already seen in SMOS's constant-bias baseline getting worse rather
-  than better (12.1) -- not yet root-caused. Worth investigating (e.g. per-region train/val/test error curves)
-  before trusting the phase-1 model's tropical predictions specifically.
+  elsewhere -- the aggregate metric was masking a real regional pattern. Root-caused in 12.3.
+
+### 12.3 Root cause of the tropical bias artifact: train/test straddles an ENSO transition
+
+Checked whether the tropical negative-bias band in 12.2 is overfitting/noise or a real signal, by comparing
+*raw* (uncorrected, no fitting involved) satellite-Argo bias in the tropics (|lat|<30) between the train
+window (2021-2022) and the test window (H2 2023):
+
+| sensor | train raw bias | test raw bias | shift |
+|---|---|---|---|
+| SMAP | +0.2522 | +0.2079 | -0.044 PSU |
+| SMOS | +0.0770 | +0.0496 | -0.027 PSU |
+
+The domain-average shift is tiny for both sensors -- nowhere near large enough to explain the ~0.5-1+ PSU
+swings seen in the FFANN's geographic bias map. That rules out a simple "the mean bias changed" explanation
+and points instead at a **spatial reorganization of the bias pattern that cancels out in the domain average**
+but shows up strongly once binned geographically. The coarse lat-band breakdown printed by
+`train_baseline.py` (e.g. SMAP FFANN bias for lat[-30,30) = -0.009, essentially zero) already hinted at this:
+it's near-zero in aggregate specifically because it's not uniform -- some basins/longitudes within the band
+run strongly negative, others near-neutral or positive, and a plain latitude-band average hides that.
+
+**Working hypothesis**: the train window (2021-2022) was almost entirely inside a prolonged "triple-dip" La
+Nina; the test window (H2 2023) falls inside the subsequent El Nino onset/strengthening (transition ~May-June
+2023). ENSO phase is known to reorganize tropical Pacific (and connected-basin) precipitation/freshwater
+patterns *spatially* without necessarily shifting the domain-wide mean much -- consistent with what's
+measured above. This also explains why validation-based early stopping never caught it: the validation window
+(H1 2023) still contains months of lingering pre-transition conditions, so it looked fine while the test
+window, entirely past the transition, didn't.
+
+This is a general climate-knowledge-based hypothesis, not something verified against an actual ENSO index in
+this session -- worth confirming against NOAA's ONI series before treating it as settled. Practical
+implication either way: **this isn't an overfitting bug fixable with more epochs or regularization** -- the
+model has no training examples of El Nino conditions at all (2021-2022 never saw one), so applying it to H2
+2023 is extrapolation to an unseen regime, not interpolation. Fixes need either (a) an ENSO-state input
+feature (e.g. ONI) so the model can condition on large-scale ocean state, and/or (b) training data spanning
+multiple ENSO phases -- not available for SMAP (capped at 2023 in this repo) but possible for SMOS (extends
+to 2025, which includes the El Nino peak/decay). See 13.3 for a related, deeper QC finding that also affects
+which observations should even be in the training set to begin with.
+
+## 13. Operational QC investigation (obsForge / GDASApp source review)
+
+The data used throughout this project came from internal NOAA EMC/OMD sources reflecting the QC and IODA
+processing applied in obsForge/global-workflow as of Jan 2026. To check how closely this project's own QC
+choices (4) matched what the operational system actually does, read the public source directly rather than
+continuing to infer thresholds empirically:
+
+- [`NOAA-EMC/obsForge`](https://github.com/NOAA-EMC/obsForge) -- the obs-to-IODA conversion code
+- [`NOAA-EMC/GDASApp`](https://github.com/NOAA-EMC/GDASApp) -- the actual DA-cycle QC filter configs
+- Both are public, no credentials needed, no bulk download required (shallow-cloned to inspect source only)
+
+### 13.1 What obsForge's converter actually does (`utils/preproc/Smap2Ioda.h`, `Smos2Ioda.h`)
+
+Both converters read the sensor's *own* official quality field and copy it through **completely
+unfiltered** -- no threshold is applied at conversion time, beyond a trivial `obsVal_ > 0.0` sanity mask:
+
+- SMAP's `PreQC` in the IODA file *is* NASA's own `quality_flag` field from the L2 product, verbatim.
+- SMOS's `PreQC` in the IODA file *is* ESA/CATDS's own `Dg_quality_SSS_corr` field, verbatim (the source
+  even cites the official ESA SMOS L2 Aux Data Product Specification for this field).
+
+This retroactively validates the empirical approach in 4 -- SMAP's `PreQC == 0` pass convention matches the
+standard NASA quality-bitmask convention (0 = no flags raised) for the exact field it turns out to be, and
+SMOS's non-bitmask, continuous-index behavior is explained by it being a genuinely different kind of field
+(a quality index, not a flag) from a different agency's product. The `PreQC < 600` threshold derived in 4 was
+inferred correctly as *a* reasonable data-driven split, but see 13.2 -- it turns out not to be what the
+operational system actually uses for QC at all.
+
+### 13.2 What GDASApp's assimilation QC actually does (`parm/jcb-gdas/observations/marine/sss_{smap,smos}_l2.yaml.j2`)
+
+Identical filter chain for both sensors, and it **does not reference `PreQC`/`quality_flag`/`Dg_quality_SSS_corr`
+anywhere**:
+
+1. `Domain Check`: `GeoVaLs/sea_area_fraction >= 0.9` (ocean mask, from model background)
+2. `Bounds Check`: SSS in `[0.1, 40.0]` PSU -- notably wider than this project's `[20, 42]`
+3. `Background Check`, threshold 5.0 -- gross-error check against the **model's own background field**,
+   not against Argo (this project's `max_abs_diff` check against Argo is a reasonable stand-in given no
+   background field is available here, but is conceptually different from the real filter)
+4. `Domain Check` with `passivate` action: `GeoVaLs/sea_surface_temperature < -4.0`C -- near-freezing/
+   ice-covered water is excluded from active assimilation (kept in the file, downweighted to zero impact)
+5. `Gaussian_Thinning` -- currently commented out/disabled in the live config (LETKF compatibility issue
+   noted in a comment), so not actually active despite being present in the file
+6. `Domain Check`: `GeoVaLs/distance_from_coast >= 100e3` (100 km) -- all near-coastal obs excluded entirely
+
+Filters 1, 3, and 4 require **GeoVaLs** -- the model's own background state (MOM6/GFS) interpolated to each
+observation location during a live DA cycle. This is fundamentally not present in the obsForge-derived obs
+files this project works with; it isn't something strippable-but-recoverable from raw satellite data either,
+it only exists as an output of running the actual coupled model. Filter 6 (distance-from-coast) is
+recoverable without model output, from a public coastline dataset -- not yet implemented here.
+
+### 13.3 Implication: this project's QC diverges from operational QC, and the divergence is informative
+
+- Filter 4 (SST < -4C passivation) exists *because* near-ice retrievals are known-bad -- this lines up
+  directly with the high-latitude Arctic-adjacent RMSE/bias hotspot found in 12.2. The operational system
+  doesn't try to correct those observations at all; it excludes them from assimilation. This project's
+  training data currently includes them, uncorrected, which likely inflates the high-latitude error metrics
+  and may be teaching the FFANN to "correct" a regime the operational system simply throws out.
+- Filter 6 (distance-from-coast) is also entirely absent from this project's pipeline -- near-coastal
+  contamination is a known satellite SSS problem and could be contributing to some of the noisier coastal
+  cells seen in 12.2's maps.
+- The `PreQC`-based filtering implemented in `build_matchups.py` is not wrong on its own terms (it removes
+  genuinely low-confidence retrievals per each sensor's own quality field) but is **not what the operational
+  system relies on** -- worth being explicit about this whenever comparing this project's results to
+  operational assimilation behavior.
+- None of this explains the ENSO-related tropical bias in 12.3 -- that's a train/test regime issue,
+  orthogonal to which observations get admitted in the first place.
+
+**Not yet acted on**: implementing the distance-from-coast filter (no blockers, public coastline data);
+deciding whether/how to approximate the SST-passivation filter given SST itself is still an unresolved
+missing-input problem for phase 2 (5).
+
+## 14. Data source access summary (for extending date ranges / recovering stripped fields)
+
+Investigated whether raw/fuller source data could be obtained to extend the SMAP/SMOS/Argo date ranges
+beyond what's in this repo, and to recover fields IODA processing strips out (SST, sensor beam, ascending/
+descending flag, roughness -- see 2's "Important gap found").
+
+| source | access | notes |
+|---|---|---|
+| Argo GDAC (raw profiles) | **Public, no login** (`ftp.ifremer.fr/ifremer/argo` or US-GODAE) | Recovers real per-obs QC and WMO float ID -- would resolve the "no float ID, can't block by platform" limitation noted in 6 |
+| obsForge / GDASApp source | **Public GitHub**, no credentials | Used directly in 13; no bulk data, just source code |
+| SMAP L2 raw swaths (PO.DAAC/JPL) | Requires NASA Earthdata Login (increasingly S3-credentialed) | Blocked -- account creation is out of scope for this assistant; needs user-provided credentials or user-downloaded files |
+| SMOS L2 raw swaths (CATDS) | "Free access by FTP upon email request" -- manual registration with a human | Blocked -- same reason |
+
+Practical caveat not yet weighed: full L2 swath archives with all original fields, across multiple years,
+are substantially larger than the already-thinned obsForge tarballs this project started from -- a real
+bandwidth/storage question even where access isn't blocked (Argo).
