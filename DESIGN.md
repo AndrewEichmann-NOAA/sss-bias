@@ -565,4 +565,75 @@ physically present in that directory. An Argo obs whose *true* time falls within
 it, even if that would be a valid match -- because that Argo obs and that satellite obs are never loaded into
 memory at the same time. The 15.2 counts are therefore a **lower bound**: some real matches are being missed,
 not just spurious ones being removed. Fixing this properly would mean scanning a +/-4-cycle neighborhood
-of Argo files against each cycle's satellite file, rather than one cycle at a time -- not yet implemented.
+of Argo files against each cycle's satellite file, rather than one cycle at a time -- **implemented in 16.**
+
+## 16. Cross-cycle-boundary matching (`match_windowed` in `build_matchups.py`)
+
+Implemented the fix flagged in 15.5: for each cycle's Argo obs, search satellite candidates from a window of
++/-`cycle_window` cycles (default 4 = +/-24h, matching Argo's wider DA assimilation window), not just the one
+cycle sharing Argo's own directory. Each candidate cycle's satellite file is loaded and its BallTree built at
+most once (cached across the sliding window), so this costs extra tree *queries* per cycle, not extra file
+I/O. Deliberately does NOT pool all candidate cycles into one combined BallTree and take the single nearest
+point -- a spatially-nearer-but-wrong-time match from a neighboring cycle could otherwise mask a valid,
+slightly-farther, correct-time match. Instead each candidate cycle is queried independently and the best
+*valid* (passes distance/time/gross-error filters) match across all of them is kept.
+
+### 16.1 An unexpected discovery: Argo profiles are replicated across cycle files
+
+Initial testing (2-week sample, `--cycle-window 4` vs `--cycle-window 0`) showed a startling ~8x increase in
+raw match count (SMAP 725 -> 6099, SMOS 958 -> 8002). Investigating *why* before trusting it turned up a real
+duplication bug: **the same physical Argo profile appears in multiple cycle files**. Traced one profile
+concretely (lat -53.53, lon -126.65, true `originalDateTime` 2022-06-01 06:10) through the output -- it showed
+up as a candidate in six different cycle files, spanning `2022-06-01 00Z` through `2022-06-02 06Z` (nearly 24h
+after its true measurement time), each copy carrying the same lat/lon/salinity/`originalDateTime` but a
+different (re-snapped) `dateTime`.
+
+This makes sense in hindsight: obsForge must replicate each Argo profile into every cycle file within its own
++/-4-cycle assimilation window, so that whichever cycle's DA run uses it, the obs is physically present in
+that cycle's own file. Since `build_matchups.py` processes each cycle's Argo file independently, the *same*
+real profile was being found and matched once per cycle-file appearance -- producing byte-identical duplicate
+rows. Fixed with `drop_duplicates(subset=['argo_lat','argo_lon','argo_datetime'])` on the final result.
+
+**A quieter version of this same bug already existed in the pre-windowing (15) matchup tables** -- checked
+directly: 116/32,615 SMAP rows and 122/61,402 SMOS rows were exact duplicates by that same key (a profile
+happening to find a valid single-cycle match in more than one of its replica cycle files). Small (~0.2-0.36%),
+not enough to have meaningfully affected the 15.3 results, but a real pre-existing data-quality issue that
+predates this session's windowing work -- now fixed as a side effect.
+
+### 16.2 The honest result: windowing recovers almost nothing, once deduplicated
+
+After fixing the duplication bug, `--cycle-window 4` vs `--cycle-window 0` on the same 2-week sample gave
+**724 vs 725 matches (SMAP)** and **953 vs 958 (SMOS)** -- essentially identical, not the ~8x suggested by the
+buggy version. The reason: Argo's own replication across ~9 cycle files (16.1) already gave single-cycle
+matching multiple independent implicit tries at finding a valid same-cycle satellite match, since the same
+profile would be re-attempted against each of its ~9 different home files' own satellite data. Deliberate
+windowing turned out to be the *more correct and principled* way to search (one consolidated search per
+profile, not luck-dependent on which specific replica's own file happens to contain a nearby satellite pass),
+but not a source of meaningfully more matches -- the ground had already been implicitly covered.
+
+Full-archive rebuild confirms this at scale:
+
+| sensor | matches (15, pre-windowing, w/ dup bug) | matches (16, windowed + deduplicated) |
+|---|---|---|
+| SMAP | 32,615 | 32,557 |
+| SMOS | 61,402 | 61,897 |
+
+Both essentially unchanged (SMAP very slightly down after removing duplicates; SMOS very slightly up, likely
+a few genuine boundary-case recoveries netting against duplicate removal). Retrained both sensors on the new
+tables -- results also essentially unchanged from 15.3:
+
+| sensor | method | RMSE (15.3) | RMSE (16) | corr (15.3) | corr (16) |
+|---|---|---|---|---|---|
+| SMAP | raw | 1.599 | 1.601 | 0.552 | 0.552 |
+| SMAP | FFANN | 1.282 | 1.284 | 0.676 | 0.676 |
+| SMOS | raw | 2.325 | 2.321 | 0.413 | 0.411 |
+| SMOS | FFANN | 1.434 | 1.430 | 0.521 | 0.523 |
+
+Geographic error maps (`geo_errors_smap.png`, `geo_errors_smos.png`) regenerated and visually unchanged from
+12.2/15.4 -- the tropical ENSO bias artifact is still present, as expected (16 doesn't touch anything related
+to that diagnosis).
+
+**Net assessment**: this was worth doing for correctness and rigor (removes a luck-dependent matching
+mechanism and a real, if small, duplication bug) even though it didn't move the headline numbers. `--cycle-window`
+is exposed as a CLI flag on `build_matchups.py` for anyone who wants to experiment with wider/narrower search
+windows later.

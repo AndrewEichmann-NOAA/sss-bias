@@ -142,52 +142,111 @@ def load_argo_near_surface(cycle_path, cycle_hour, max_depth, min_salinity, max_
     return grouped
 
 
-def match_cycle(sat_df, argo_df, max_dist_km, max_time_delta, max_abs_diff):
-    """Nearest-neighbor match each Argo near-surface obs to a satellite obs.
+def build_sat_tree(sat_df):
+    """Build a haversine BallTree over a satellite cycle's obs, or None if empty."""
+    if sat_df is None or sat_df.empty:
+        return None
+    sat_rad = np.radians(sat_df[['lat', 'lon']].to_numpy())
+    return BallTree(sat_rad, metric='haversine')
 
-    max_abs_diff is a gross-error/background-check style filter on the
-    matched pair itself: per-obs physical-range QC alone still lets through
-    matches like a stuck-sensor Argo profile reporting ~9 PSU in the open
-    ocean (physically implausible for that region, but inside a lenient
-    [min_salinity, max_salinity] band) paired against a normal ~36 PSU
-    satellite retrieval. A >30 PSU discrepancy is a QC failure, not bias
-    signal to learn from, so pairs are rejected outright rather than left in
-    as extreme training examples.
+
+def match_windowed(argo_df, candidates, max_dist_km, max_time_delta, max_abs_diff):
+    """Match each Argo near-surface obs to the best satellite obs across a WINDOW of
+    nearby cycles, not just the one cycle sharing Argo's own directory.
+
+    `candidates` is a list of (sat_df, tree) tuples, one per cycle in the window
+    (typically +/-4 cycles = +/-24h, matching Argo's wider DA assimilation window --
+    see build_matchups.py module docstring and DESIGN.md 15.5). Each candidate cycle
+    is queried independently for its own nearest-by-space match to every Argo obs;
+    across all candidate cycles, the best (smallest distance) match that ALSO passes
+    the time/distance/gross-error filters is kept per Argo obs. This is deliberately
+    NOT "pool all candidate cycles into one BallTree and take the single nearest,"
+    because a spatially-nearer-but-wrong-time match from a neighboring cycle could
+    otherwise mask a valid, slightly-farther, correct-time match -- the whole point
+    of searching a cycle window is to recover genuinely valid matches, not just to
+    prefer whatever point happens to be closest in space regardless of time.
+
+    max_abs_diff is a gross-error/background-check style filter on the matched pair
+    itself: per-obs physical-range QC alone still lets through matches like a
+    stuck-sensor Argo profile reporting ~9 PSU in the open ocean (physically
+    implausible for that region, but inside a lenient [min_salinity, max_salinity]
+    band) paired against a normal ~36 PSU satellite retrieval. A >30 PSU discrepancy
+    is a QC failure, not bias signal to learn from, so pairs are rejected outright
+    rather than left in as extreme training examples.
     """
-    if sat_df is None or argo_df is None or sat_df.empty or argo_df.empty:
+    if argo_df is None or argo_df.empty:
         return pd.DataFrame()
 
-    sat_rad = np.radians(sat_df[['lat', 'lon']].to_numpy())
-    tree = BallTree(sat_rad, metric='haversine')
-
+    argo_df = argo_df.reset_index(drop=True)
     argo_rad = np.radians(argo_df[['lat', 'lon']].to_numpy())
-    dist_rad, idx = tree.query(argo_rad, k=1)
-    dist_km = dist_rad[:, 0] * EARTH_RADIUS_KM
-    idx = idx[:, 0]
+    argo_salinity = argo_df['salinity'].to_numpy()
+    argo_datetime = argo_df['datetime'].to_numpy()
+    n = len(argo_df)
 
-    matched_sat = sat_df.iloc[idx].reset_index(drop=True)
-    result = argo_df.reset_index(drop=True).rename(columns={
+    best_dist = np.full(n, np.inf)
+    best_sss = np.full(n, np.nan)
+    best_lat = np.full(n, np.nan)
+    best_lon = np.full(n, np.nan)
+    best_basin = np.full(n, np.nan)
+    best_datetime = np.full(n, np.datetime64('NaT'), dtype='datetime64[ns]')
+    best_time_delta = np.full(n, np.timedelta64('NaT'), dtype='timedelta64[ns]')
+
+    for sat_df, tree in candidates:
+        if sat_df is None or tree is None or sat_df.empty:
+            continue
+
+        dist_rad, idx = tree.query(argo_rad, k=1)
+        dist_km = dist_rad[:, 0] * EARTH_RADIUS_KM
+        idx = idx[:, 0]
+
+        cand_sss = sat_df['sss'].to_numpy()[idx]
+        cand_lat = sat_df['lat'].to_numpy()[idx]
+        cand_lon = sat_df['lon'].to_numpy()[idx]
+        cand_basin = sat_df['oceanBasin'].to_numpy()[idx]
+        cand_datetime = sat_df['datetime'].to_numpy()[idx]
+        cand_time_delta = np.abs(argo_datetime - cand_datetime)
+        cand_abs_diff = np.abs(cand_sss - argo_salinity)
+
+        valid = (dist_km <= max_dist_km) & (cand_time_delta <= np.timedelta64(max_time_delta)) \
+            & (cand_abs_diff <= max_abs_diff)
+        cand_dist = np.where(valid, dist_km, np.inf)
+
+        improve = cand_dist < best_dist
+        if not improve.any():
+            continue
+        best_dist = np.where(improve, cand_dist, best_dist)
+        best_sss = np.where(improve, cand_sss, best_sss)
+        best_lat = np.where(improve, cand_lat, best_lat)
+        best_lon = np.where(improve, cand_lon, best_lon)
+        best_basin = np.where(improve, cand_basin, best_basin)
+        best_datetime = np.where(improve, cand_datetime, best_datetime)
+        best_time_delta = np.where(improve, cand_time_delta, best_time_delta)
+
+    result = argo_df.rename(columns={
         'lat': 'argo_lat', 'lon': 'argo_lon', 'datetime': 'argo_datetime',
         'oceanBasin': 'argo_oceanBasin', 'salinity': 'argo_salinity', 'depth': 'argo_depth',
     })
-    result['sat_sss'] = matched_sat['sss'].to_numpy()
-    result['sat_lat'] = matched_sat['lat'].to_numpy()
-    result['sat_lon'] = matched_sat['lon'].to_numpy()
-    result['sat_datetime'] = matched_sat['datetime'].to_numpy()
-    result['sat_oceanBasin'] = matched_sat['oceanBasin'].to_numpy()
-    result['dist_km'] = dist_km
-    result['time_delta'] = (result['argo_datetime'] - result['sat_datetime']).abs()
+    result['sat_sss'] = best_sss
+    result['sat_lat'] = best_lat
+    result['sat_lon'] = best_lon
+    result['sat_datetime'] = best_datetime
+    result['sat_oceanBasin'] = best_basin
+    result['dist_km'] = best_dist
+    result['time_delta'] = best_time_delta
 
-    abs_diff = (result['sat_sss'] - result['argo_salinity']).abs()
-    mask = ((result['dist_km'] <= max_dist_km)
-            & (result['time_delta'] <= max_time_delta)
-            & (abs_diff <= max_abs_diff))
+    mask = np.isfinite(best_dist)
     return result[mask].reset_index(drop=True)
 
 
 def build_matchups(base_dir, sensor, start_date, end_date, max_dist_km, max_time_delta_hours,
                     max_depth=5.0, min_salinity=20.0, max_salinity=42.0, max_abs_diff=10.0,
-                    verbose=True):
+                    cycle_window=4, verbose=True):
+    """cycle_window: how many 6h cycles on either side of an Argo obs's own cycle to
+    search for a satellite match (default 4 = +/-24h, matching Argo's wider DA
+    assimilation window -- see DESIGN.md 15.5). Satellite files are loaded and their
+    BallTree built at most once each (cached across the sliding window), so this
+    costs ~cycle_window extra tree queries per cycle, not extra file I/O.
+    """
     processor = NetCDFCycleProcessor(base_dir)
     cycle_dirs = processor.find_cycle_directories(start_date, end_date)
     print(f"Found {len(cycle_dirs)} cycle directories")
@@ -195,17 +254,27 @@ def build_matchups(base_dir, sensor, start_date, end_date, max_dist_km, max_time
     max_time_delta = pd.Timedelta(hours=max_time_delta_hours)
     all_matches = []
     total_argo = 0
-    total_sat = 0
+    total_sat_loaded = 0
 
-    for date, cycle, cycle_path in cycle_dirs:
-        sat_df = load_sat_sss(cycle_path, cycle, sensor, min_salinity, max_salinity)
+    sat_cache = {}  # cycle index -> (sat_df, tree), sliding window
+
+    def get_sat(idx):
+        if idx not in sat_cache:
+            _, cyc, cpath = cycle_dirs[idx]
+            sdf = load_sat_sss(cpath, cyc, sensor, min_salinity, max_salinity)
+            sat_cache[idx] = (sdf, build_sat_tree(sdf))
+        return sat_cache[idx]
+
+    for i, (date, cycle, cycle_path) in enumerate(cycle_dirs):
         argo_df = load_argo_near_surface(cycle_path, cycle, max_depth, min_salinity, max_salinity)
-        matches = match_cycle(sat_df, argo_df, max_dist_km, max_time_delta, max_abs_diff)
+
+        window = range(max(0, i - cycle_window), min(len(cycle_dirs), i + cycle_window + 1))
+        candidates = [get_sat(j) for j in window]
+
+        matches = match_windowed(argo_df, candidates, max_dist_km, max_time_delta, max_abs_diff)
 
         n_argo = 0 if argo_df is None else len(argo_df)
-        n_sat = 0 if sat_df is None else len(sat_df)
         total_argo += n_argo
-        total_sat += n_sat
 
         if not matches.empty:
             matches['cycle_date'] = date
@@ -213,17 +282,45 @@ def build_matchups(base_dir, sensor, start_date, end_date, max_dist_km, max_time
             all_matches.append(matches)
 
         if verbose:
+            n_sat_center = len(candidates[min(i, cycle_window)][0]) \
+                if candidates and candidates[min(i, cycle_window)][0] is not None else 0
             print(f"  {date.strftime('%Y-%m-%d')} {cycle}Z: "
-                  f"{n_argo} argo near-surface, {n_sat} {sensor} obs, "
-                  f"{len(matches)} matches")
+                  f"{n_argo} argo near-surface, {n_sat_center} {sensor} obs (own cycle), "
+                  f"{len(matches)} matches (searched +/-{cycle_window} cycles)")
 
-    print(f"\nTotals: {total_argo} argo near-surface obs, {total_sat} {sensor} obs scanned")
+        # Evict cache entries no longer needed by any future iteration.
+        evict_before = i + 1 - cycle_window
+        for j in [k for k in sat_cache if k < evict_before]:
+            sdf, _ = sat_cache.pop(j)
+            if sdf is not None:
+                total_sat_loaded += len(sdf)
+
+    # Account for any cache entries still resident at the end of the loop.
+    for sdf, _ in sat_cache.values():
+        if sdf is not None:
+            total_sat_loaded += len(sdf)
+
+    print(f"\nTotals: {total_argo} argo near-surface obs scanned (raw, NOT deduplicated -- see below), "
+          f"{total_sat_loaded} {sensor} obs loaded "
+          f"(each satellite file loaded at most once, reused across the +/-{cycle_window}-cycle window)")
 
     if not all_matches:
         print("No matches found.")
         return pd.DataFrame()
 
     result = pd.concat(all_matches, ignore_index=True)
+
+    # Argo profiles are replicated across every cycle file within their own
+    # +/-4-cycle assimilation window (obsForge puts the same profile in each
+    # cycle's file so that cycle's DA run has it available). Since each cycle
+    # is processed independently, the same real profile is found and matched
+    # once per cycle file it appears in (up to 2*cycle_window+1 times),
+    # producing byte-identical duplicate rows -- collapse them here.
+    n_before_dedup = len(result)
+    result = result.drop_duplicates(subset=['argo_lat', 'argo_lon', 'argo_datetime']).reset_index(drop=True)
+    print(f"Deduplicated {n_before_dedup} raw matches (one per cycle-file appearance of the same "
+          f"Argo profile) down to {len(result)} unique profile-satellite matches.")
+
     return result
 
 
@@ -240,6 +337,9 @@ def main():
     parser.add_argument('--max-salinity', type=float, default=42.0, help='Valid-range QC upper bound (PSU)')
     parser.add_argument('--max-abs-diff', type=float, default=10.0,
                          help='Reject matched pairs with |satellite - Argo| beyond this (PSU); gross-error check')
+    parser.add_argument('--cycle-window', type=int, default=4,
+                         help='Search +/-N cycles for a satellite match, not just Argo\'s own cycle '
+                              '(default 4 = +/-24h, matching Argo\'s wider DA assimilation window)')
     parser.add_argument('--out', default=None,
                          help='Defaults to data/matchups/<sensor>_argo_matchups.parquet')
     parser.add_argument('--quiet', action='store_true')
@@ -253,7 +353,7 @@ def main():
         args.base_dir, args.sensor, start_date, end_date,
         args.max_dist_km, args.max_time_delta_hours,
         max_depth=args.max_depth, min_salinity=args.min_salinity, max_salinity=args.max_salinity,
-        max_abs_diff=args.max_abs_diff,
+        max_abs_diff=args.max_abs_diff, cycle_window=args.cycle_window,
         verbose=not args.quiet,
     )
 
