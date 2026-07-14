@@ -77,13 +77,15 @@ def argo_stage_counts(cycle_path, cycle_hour):
     if not f.exists():
         return None
     try:
-        meta = xr.open_dataset(f, group='MetaData', engine='netcdf4')
+        meta = xr.open_dataset(f, group='MetaData', engine='netcdf4', decode_times=False)
         obs = xr.open_dataset(f, group='ObsValue', engine='netcdf4')
         sal = obs['salinity'].values
         depth = meta['depth'].values
         lat = meta['latitude'].values
         lon = meta['longitude'].values
-        dt = meta['dateTime'].values
+        # Use originalDateTime, not dateTime -- see build_matchups.py note on
+        # Argo's +/-4-cycle window vs. dateTime being snapped to a cycle slot.
+        dt = pd.to_datetime(meta['originalDateTime'].values, unit='s', origin='unix')
         basin = meta['oceanBasin'].values
         meta.close()
         obs.close()
@@ -91,7 +93,8 @@ def argo_stage_counts(cycle_path, cycle_hour):
         print(f"  Error loading Argo {f}: {e}")
         return None
 
-    near_surface = ~np.isnan(sal) & (depth <= MAX_DEPTH)
+    plausible = (dt >= pd.Timestamp('2000-01-01')) & (dt <= pd.Timestamp('2030-01-01'))
+    near_surface = ~np.isnan(sal) & (depth <= MAX_DEPTH) & plausible
     n_raw = int(near_surface.sum())
     in_range = (sal >= MIN_SALINITY) & (sal <= MAX_SALINITY)
     range_fail = near_surface & ~in_range

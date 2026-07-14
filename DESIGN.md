@@ -50,6 +50,10 @@ a shallow-averaged in-situ value, not a single-depth point sample.
 
 ## 4. Matchup / collocation methodology
 
+**Note**: this section's matchup counts/stats predate the `originalDateTime` fix in 15 -- the actual
+timestamp used for Argo time-matching was wrong for ~86-91% of obs until then. See 15 for the corrected
+numbers; the methodology description below (space/time window choice, QC layers) is otherwise still accurate.
+
 SMAP and Argo obs are not on the same grid — they must be paired by proximity in space and time. Proposed
 default window, tunable later:
 
@@ -249,6 +253,10 @@ this session; a git repository was initialized at the new root and pushed to
   produced no output) and should be avoided in favor of the direct interpreter path or `conda activate`.
 
 ## 12. Phase 1 results (`src/train_baseline.py`)
+
+**Note**: superseded by the `originalDateTime` fix in 15 -- see 15.3 for corrected numbers (SMAP improved,
+SMOS roughly a wash). Kept here for the record of how results evolved; the qualitative conclusions (FFANN
+beats all baselines, basin-0 instability, etc.) still hold.
 
 Split sizes: train 100,599 / validate 30,722 / test 30,996. Test-set metrics (2023-07-15 to 2023-12-31):
 
@@ -479,3 +487,82 @@ descending flag, roughness -- see 2's "Important gap found").
 Practical caveat not yet weighed: full L2 swath archives with all original fields, across multiple years,
 are substantially larger than the already-thinned obsForge tarballs this project started from -- a real
 bandwidth/storage question even where access isn't blocked (Argo).
+
+## 15. Major correction: Argo timestamps were wrong (`dateTime` vs. `originalDateTime`)
+
+**Everything in 4, 6, 12, 12.1, 12.2, 12.3 above used the wrong Argo timestamp.** `build_matchups.py` read
+Argo's `dateTime` field for both the +/-3h time-window match filter and the `time_delta`/gross-error QC. Per
+domain input: Argo obs are assimilated on a wider +/-4-cycle window than satellite obs (which use +/-3h), and
+during IODA processing `dateTime` gets snapped to a nearby synoptic cycle slot for DA-window bookkeeping,
+while the true measurement time is preserved separately in `originalDateTime`.
+
+### 15.1 Verifying the bug
+
+Checked directly against the data (three sampled cycles across different years):
+
+| cycle | frac. `dateTime == originalDateTime` | `dateTime - originalDateTime` range |
+|---|---|---|
+| 2021-10-01 12Z | 13.7% | -25h to +24h |
+| 2022-06-07 00Z | 11.1% | -25h to +24h |
+| 2023-03-15 06Z | 9.1% | -23h to +24h |
+
+Only ~9-14% of Argo obs had a `dateTime` matching their true observation time; the rest were offset by up to
+a full day, spread across nearly the entire range rather than clustered near zero. This means `build_matchups.py`
+was silently pairing satellite retrievals with Argo profiles up to ~24h apart while its own QC believed them
+to be within the 3h match window -- pure temporal-mismatch noise with no relationship to actual satellite
+bias, on top of everything else already in the matchup table. (Also checked: the `(lat, lon, dateTime)`
+profile-grouping key stays valid despite this -- only 3 of 988 groups in the sample had ambiguous
+`originalDateTime`, i.e. two genuinely different casts sharing a group key. Not a real concern.)
+
+### 15.2 Fix and impact on matchup counts
+
+`build_matchups.py` and `qc_diagnostics.py` now use `originalDateTime` (converted from raw epoch-seconds
+float, since like `salinity` it carries no `_FillValue`/`units` attributes -- a plausible-range guard
+[2000, 2030] is applied defensively, though a full-archive sample found zero implausible values). Full-archive
+rebuild:
+
+| sensor | matchups before fix | matchups after fix | retained |
+|---|---|---|---|
+| SMAP | 166,149 | **32,615** | 19.6% |
+| SMOS | 298,115 | **61,402** | 20.6% |
+
+The ~80% drop is expected and correct -- it's removing spurious matches that were never really within 3
+hours of each other, not losing good data (with one caveat, see 15.5).
+
+### 15.3 Impact on phase-1 results
+
+Retrained both sensors on the corrected matchup tables (same 2021-2022 train / H1 2023 val / H2 2023 test
+windows). Test-set metrics, before -> after:
+
+| sensor | method | RMSE before | RMSE after | bias before | bias after | corr before | corr after |
+|---|---|---|---|---|---|---|---|
+| SMAP | raw | 1.643 | 1.599 | +0.365 | +0.342 | 0.536 | 0.552 |
+| SMAP | FFANN | 1.348 | **1.282** | +0.050 | +0.044 | 0.653 | **0.676** |
+| SMOS | raw | 2.318 | 2.325 | +0.025 | -0.005 | 0.407 | 0.413 |
+| SMOS | FFANN | 1.429 | 1.434 | +0.056 | +0.131 | 0.540 | 0.521 |
+
+SMAP improved modestly across the board after the fix (lower RMSE, higher correlation) -- consistent with
+removing pure noise from the training/test data. SMOS is roughly a wash (FFANN RMSE flat, correlation and
+bias slightly worse) -- plausibly just sampling noise given the much smaller test set now (5,178 vs. 27,213
+rows), though not confirmed. Test sets shrank a lot (SMAP 30,996 -> 6,173; SMOS 27,213 -> 5,178) -- still
+workable for this small model, but worth keeping in mind for how much to trust fine-grained (e.g.
+per-basin) breakdowns going forward.
+
+### 15.4 The tropical ENSO bias artifact (12.3) survives the fix
+
+Regenerated the geographic error maps (`geo_errors_smap.png`, `geo_errors_smos.png`) on the corrected data.
+**The tropical/subtropical negative-bias band in the FFANN-corrected panels is still there for both sensors**,
+sparser now (far fewer test points per cell) but the same basic pattern. This is useful negative evidence:
+it rules out the datetime bug as the explanation for that artifact (a plausible alternative hypothesis before
+this fix) and strengthens the ENSO train/test regime-shift diagnosis in 12.3, since the artifact persists
+after removing an entirely unrelated source of noise.
+
+### 15.5 Known residual limitation: cross-cycle-boundary matches are not recovered
+
+`build_matchups.py` processes one cycle directory at a time, loading only the satellite and Argo files
+physically present in that directory. An Argo obs whose *true* time falls within 3h of a satellite obs in a
+*different* cycle's directory (up to +/-4 cycles away, per the wider Argo DA window) will never be matched to
+it, even if that would be a valid match -- because that Argo obs and that satellite obs are never loaded into
+memory at the same time. The 15.2 counts are therefore a **lower bound**: some real matches are being missed,
+not just spurious ones being removed. Fixing this properly would mean scanning a +/-4-cycle neighborhood
+of Argo files against each cycle's satellite file, rather than one cycle at a time -- not yet implemented.

@@ -90,18 +90,31 @@ def load_argo_near_surface(cycle_path, cycle_hour, max_depth, min_salinity, max_
     carried through the obsForge/IODA conversion, so we apply a physically
     motivated valid-range filter instead (min_salinity/max_salinity), rather
     than trusting PreQC.
+
+    NOTE: uses `originalDateTime`, not `dateTime`, as the observation
+    timestamp. Argo obs are assimilated on a wider +/-4-cycle window than
+    satellite obs, and `dateTime` is snapped to a nearby synoptic cycle slot
+    for IODA/DA-window bookkeeping -- verified only ~9-14% of obs have
+    `dateTime == originalDateTime` in sampled cycles, with the rest offset
+    by up to +/-24h. Using `dateTime` here would silently pair satellite
+    retrievals with Argo profiles up to a day apart while believing them to
+    be within the 3h match window. `originalDateTime` has no _FillValue
+    attribute (like `salinity`, see above), so a plausible-range guard
+    (2000-2030) is applied defensively, though a full-archive sample found
+    zero implausible values.
     """
     f = cycle_path / 'insitu' / f'gdas.t{cycle_hour}z.insitu_salt_profile_argo.nc'
     if not f.exists():
         return None
 
     try:
-        meta = xr.open_dataset(f, group='MetaData', engine='netcdf4')
+        meta = xr.open_dataset(f, group='MetaData', engine='netcdf4', decode_times=False)
         obs = xr.open_dataset(f, group='ObsValue', engine='netcdf4')
+        original_dt = meta['originalDateTime'].values
         df = pd.DataFrame({
             'lat': meta['latitude'].values,
             'lon': meta['longitude'].values,
-            'datetime': meta['dateTime'].values,
+            'datetime': pd.to_datetime(original_dt, unit='s', origin='unix'),
             'oceanBasin': meta['oceanBasin'].values,
             'depth': meta['depth'].values,
             'salinity': obs['salinity'].values,
@@ -111,6 +124,9 @@ def load_argo_near_surface(cycle_path, cycle_hour, max_depth, min_salinity, max_
     except Exception as e:
         print(f"  Error loading Argo {f}: {e}")
         return None
+
+    plausible_lo, plausible_hi = pd.Timestamp('2000-01-01'), pd.Timestamp('2030-01-01')
+    df = df[df['datetime'].between(plausible_lo, plausible_hi)]
 
     df = df[df['depth'] <= max_depth].dropna(subset=['salinity'])
     df = df[df['salinity'].between(min_salinity, max_salinity)]
