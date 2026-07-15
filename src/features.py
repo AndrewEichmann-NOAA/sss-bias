@@ -20,13 +20,15 @@ TARGET_COLUMN = 'argo_salinity'
 
 # Split boundaries from DESIGN.md section 6, chosen after discovering SMAP
 # obs in this repo only span 2021-2023. 14-day embargo gaps at each boundary
-# absorb float-drift leakage (Argo has no float ID to block on directly).
+# absorb float-drift leakage for rows with no recovered float ID (see below).
 TRAIN_START = pd.Timestamp('2021-01-01')
 TRAIN_END = pd.Timestamp('2022-12-31')
 VAL_START = pd.Timestamp('2023-01-15')
 VAL_END = pd.Timestamp('2023-06-30')
 TEST_START = pd.Timestamp('2023-07-15')
 TEST_END = pd.Timestamp('2023-12-31')
+
+_PARTITION_ORDER = {'train': 0, 'val': 1, 'test': 2}
 
 
 def add_features(df):
@@ -48,7 +50,60 @@ def add_features(df):
 
 
 def split_data(df, date_col='cycle_date'):
-    """Chronological train/validate/test split with embargo gaps."""
+    """Chronological train/validate/test split with embargo gaps, made
+    float-aware where a WMO float ID was recovered (see DESIGN.md 17/18):
+    a float is assigned entirely to whichever of train/val/test contains its
+    EARLIEST in-window observation, and every other row from that same float
+    follows it there -- so no float ever appears in more than one partition.
+
+    Rows with no recovered float ID (`wmo` NaN -- ~5% of SMAP, ~21% of SMOS)
+    keep the naive date-only assignment; the embargo gaps are their only
+    protection against float-drift leakage, same as before this change.
+    Embargo-period rows are dropped exactly as before regardless of wmo --
+    this reassignment only ever moves rows *between* train/val/test, never
+    pulls an embargo-dropped row back in.
+    """
+    dates = pd.to_datetime(df[date_col])
+    naive = pd.Series(np.nan, index=df.index, dtype=object)
+    naive[(dates >= TRAIN_START) & (dates <= TRAIN_END)] = 'train'
+    naive[(dates >= VAL_START) & (dates <= VAL_END)] = 'val'
+    naive[(dates >= TEST_START) & (dates <= TEST_END)] = 'test'
+
+    in_window = naive.notna()
+    has_wmo = df['wmo'].notna() if 'wmo' in df.columns else pd.Series(False, index=df.index)
+    eligible = in_window & has_wmo
+
+    owner = pd.DataFrame({
+        'wmo': df.loc[eligible, 'wmo'],
+        'partition': naive[eligible],
+        'date': dates[eligible],
+    })
+    owner['order'] = owner['partition'].map(_PARTITION_ORDER)
+    owning_partition = (owner.sort_values(['wmo', 'order', 'date'])
+                             .groupby('wmo')['partition'].first())
+
+    final = naive.copy()
+    reassigned = df['wmo'].map(owning_partition) if 'wmo' in df.columns else pd.Series(np.nan, index=df.index)
+    mask = reassigned.notna()
+    final[mask] = reassigned[mask]
+    # A float-owned row outside any train/val/test window (pure embargo) has
+    # no entry in `naive` and thus no entry in `owner`/`owning_partition`
+    # either, so `reassigned` never pulls embargo rows back in -- only rows
+    # already in some window can move to a *different* window.
+
+    train = df[final == 'train'].reset_index(drop=True)
+    val = df[final == 'val'].reset_index(drop=True)
+    test = df[final == 'test'].reset_index(drop=True)
+    return train, val, test
+
+
+def split_data_naive(df, date_col='cycle_date'):
+    """Pure date-based train/validate/test split, ignoring float ID entirely
+    (the original pre-18 behavior). Kept alongside split_data() specifically
+    to let float_leakage_diagnostic.py test whether float-based leakage is
+    empirically material for this model, rather than assuming it -- see the
+    discussion in DESIGN.md 18.3.
+    """
     dates = pd.to_datetime(df[date_col])
     train = df[(dates >= TRAIN_START) & (dates <= TRAIN_END)].reset_index(drop=True)
     val = df[(dates >= VAL_START) & (dates <= VAL_END)].reset_index(drop=True)

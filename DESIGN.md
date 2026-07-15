@@ -788,6 +788,77 @@ calendar time for new floats to appear within each window, growing val/test back
 representative size. Deferred for now per the plan agreed this session (float ID/rigor first, profile-set
 expansion later).
 
-**Open decision, not yet resolved**: keep this stricter, leak-free split as the new default despite small/
-noisy val/test, or find a compromise (e.g., blocked/rolling CV across multiple date windows per 6, to average
-out the small-sample noise) before trusting comparisons against it.
+**Resolved in 18.3-18.5 below**: rather than debate the open decision above, tested empirically whether
+float-level leakage is actually material for this model. It isn't -- the float-aware split has been
+reverted to the plain date-based one as the default.
+
+### 18.3 Testing whether float leakage is actually material, rather than assuming it
+
+Challenged directly: bulk salinity is a physical property of the ocean, not of the instrument measuring it.
+If Argo floats are well-calibrated and QC-good data is truly interchangeable across instruments, float
+identity shouldn't matter, and the whole float-aware partitioning in 18.1/18.2 would be solving a problem
+that doesn't exist for this model (which never takes float ID as an input in the first place).
+
+Built `src/float_leakage_diagnostic.py` to test this directly rather than continue reasoning about it in the
+abstract: train on the plain date-based split (`split_data_naive`, full-size test set), then label each test
+row by whether its float *also* has rows in train ("seen"), has no rows in train at all ("unseen", i.e. a
+genuinely novel instrument), or has no recovered float ID ("unknown"). If "seen" test rows show better error
+than "unseen" ones, that's evidence of real instrument-level leakage; if not, the concern is unfounded for
+this model.
+
+**Result: no evidence of leakage, and if anything the opposite pattern.**
+
+| sensor | group | n | raw RMSE | FFANN RMSE | improvement |
+|---|---|---|---|---|
+| SMAP | seen | 4,312 | 1.652 | 1.353 | 18.1% |
+| SMAP | unseen | 1,364 | 1.233 | 0.790 | 35.9% |
+| SMOS | seen | 3,000 | 2.340 | 1.416 | 39.5% |
+| SMOS | unseen | 1,831 | 2.271 | 1.245 | 45.2% |
+
+"Seen" floats show *worse* RMSE than "unseen" in both sensors, both before and after correction -- the
+opposite of what leakage would predict. Critically, **the gap is already present in the raw, uncorrected
+satellite data**, which the model never touches -- so it can't be a model artifact. It's a population
+difference between long-lived floats (in train because they've been active since 2021-2022) and newly-
+deployed ones (first appearing during the test window), not evidence of instrument-identity memorization.
+The model's relative improvement (raw -> corrected) is also slightly *larger* for unseen floats in both
+sensors, again the opposite of the leakage prediction.
+
+Side finding from the same run: the "unknown" (no recovered float ID) group has the worst error of the three
+in both sensors and both raw/corrected -- confirms these rows aren't missing at random (14 speculated this;
+now confirmed).
+
+**Decision: reverted to `split_data_naive` as the function actually used by `train_baseline.py`.**
+`split_data()` (float-aware) is kept in `features.py` for reference/future use -- e.g. if 17's profile-set
+expansion ever grows val/test enough to make strict float grouping affordable again -- but is not the
+current default. Recovers the full-size test sets (SMAP 6,124, SMOS 5,212) rather than the collapsed
+1,035/10,592 from 18.2.
+
+### 18.4 Chasing the seen/unseen gap: two hypotheses, both weakened by evidence
+
+Investigated *why* seen floats show worse error than unseen ones (a real, if now-understood-as-harmless-to-
+leakage, pattern worth understanding). Two mechanistic hypotheses, both checked against data rather than left
+as speculation:
+
+- **Regional/drift hypothesis**: long-lived floats have had years to drift into dynamically active regions
+  (fronts, boundary currents) that are harder for both satellite retrieval and Argo profiling geometry;
+  newly-deployed floats sit near their deliberately-chosen, more "typical" deployment sites. Checked: mean
+  |latitude| and ocean-basin distribution for seen vs. unseen test rows, both sensors. Result: nearly
+  identical between groups (mean |lat| within ~2 degrees; similar basin fractions) -- weakens this as the
+  primary driver, though a finer-grained check (specific frontal proximity, not just basin/lat) wasn't done.
+- **Sensor-aging hypothesis**: real-time (non-delayed-mode) data doesn't get drift/calibration correction;
+  older floats have had more time to accumulate it. Tested directly (`src/test_sensor_aging_hypothesis.py`):
+  fetched the actual GDAC profile file for all 9,267 unique seen/unseen test profiles (via direct HTTPS,
+  bypassing argopy's `profile()` fetcher which errors on this dataset's filename pattern -- see script
+  docstring), compared each profile's real-time (obsForge-derived) near-surface salinity against its own
+  delayed-mode-preferred value. **Result: does not support the hypothesis.** Median discrepancy is tiny and
+  nearly identical between groups (~0.0001-0.0002 PSU for both seen and unseen, both sensors) -- most
+  profiles in both groups already agree closely between real-time and delayed-mode, contradicting an
+  "accumulated drift" story. Mean discrepancy is actually slightly *higher* for unseen floats in both
+  sensors, opposite the hypothesis's predicted direction, though driven by heavier-tailed outliers (much
+  larger std for unseen) rather than a systematic shift.
+
+**Net: both leading hypotheses are weakened by direct evidence, and the true cause of the seen/unseen gap is
+an open question.** The gap itself is real (too large to dismiss as pure sampling noise) but its explanation
+isn't pinned down by what's been checked -- left unresolved rather than reaching for a third untested story.
+Not blocking anything (18.3 already established the gap doesn't threaten model validity), just an
+interesting loose end if revisited later.

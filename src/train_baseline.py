@@ -19,7 +19,12 @@ import torch
 import torch.nn as nn
 from sklearn.linear_model import LinearRegression
 
-from features import add_features, split_data, Standardizer, FEATURE_COLUMNS, TARGET_COLUMN
+from features import add_features, split_data_naive as split_data, Standardizer, FEATURE_COLUMNS, TARGET_COLUMN
+# Uses the plain date-based split, not the float-aware split_data() -- see
+# DESIGN.md 18.3: tested empirically whether float-level train/test leakage
+# is material for this model and found no evidence of it, so the float-aware
+# version (kept in features.py for reference) isn't worth its cost in
+# val/test size.
 
 torch.manual_seed(0)
 np.random.seed(0)
