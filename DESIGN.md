@@ -862,3 +862,73 @@ an open question.** The gap itself is real (too large to dismiss as pure samplin
 isn't pinned down by what's been checked -- left unresolved rather than reaching for a third untested story.
 Not blocking anything (18.3 already established the gap doesn't threaten model validity), just an
 interesting loose end if revisited later.
+
+## 19. Are the white gaps in the corrected maps a deployment-confidence problem?
+
+Prompted by a direct question: if this model were used operationally for SMAP/SMOS bias correction feeding
+an ocean model, do the white (masked, <5 obs) gaps in 12.2's corrected panels mark where the correction
+shouldn't be trusted? And is it sound to deploy a correction that isn't verified everywhere?
+
+### 19.1 Test-coverage gaps are not the same thing as model confidence
+
+The FFANN is a plain deterministic network with no self-aware uncertainty signal -- it produces a point
+estimate for any SMAP/SMOS pixel, including places with zero Argo verification, with no internal "I'm
+extrapolating" flag. So the white gaps mark where *we* can't verify performance, not where the model itself
+expresses low confidence. The two are related but distinct: low test-window density is a reasonable *proxy*
+for low training-window density (Argo's spatial sampling pattern is fairly stable year to year), and low
+training density is a real reason to distrust a learned local correction -- but proxy isn't identity.
+
+**Concrete evidence this isn't hypothetical**: ocean basin 0, the smallest-sample basin in this project
+(11-45 test rows), is exactly the case where the FFANN did *worse* than the raw or constant-bias baseline
+(12) -- a real, already-observed instance of extra model flexibility hurting in a sparse region rather than
+generalizing.
+
+**Structural parallel already in the operational system**: GDASApp's own QC (13, 18) uses domain checks
+(sea_area_fraction, distance-from-coast, SST passivation) to exclude assimilation in specific
+known-unreliable conditions. The same principle applies to gating a *correction*, not just raw observations:
+apply the learned correction where locally well-supported, fall back to something safer (raw value, or the
+simpler constant-bias correction, far less prone to this failure mode) where it isn't.
+
+**Answer to the soundness question**: applying the same learned, spatially-varying correction everywhere
+with no gating is not sound -- it risks introducing a new, unvalidated bias exactly where there's the least
+ability to catch it. A gated/tiered deployment (ML correction where supported, safer fallback elsewhere) is
+the standard, defensible approach, not a special case invented for this project.
+
+### 19.2 Training density vs. test-masked cells: quantified overlap (`src/plot_training_density.py`)
+
+Checked how much of the test-set masking is genuine low-confidence (also sparse in training) vs. just a
+short-test-window validation blind spot over otherwise-adequate training data:
+
+| sensor | masked test cells | also low train density (real concern) | zero training data (pure extrapolation) | train was fine (validation-only gap) |
+|---|---|---|---|---|
+| SMAP | 552 | 97 (17.6%) | 27 (4.9%) | 428 (77.5%) |
+| SMOS | 700 | 309 (44.1%) | 129 (18.4%) | 262 (37.4%) |
+
+**SMAP**: the large majority (77.5%) of its masked test cells were actually well-sampled during training --
+mostly a validation-window artifact, not a real confidence problem. Only ~22.5% combined represent genuine
+low-training-support regions. **SMOS is meaningfully worse**: 62.5% combined are real low-confidence zones
+(44.1% compounding sparse train+test, 18.4% literally zero training support). This matters directly for 19.1
+-- SMOS would need confidence-gating before any operational use much more urgently than SMAP.
+
+### 19.3 Is Argo itself sparse in the gap regions? No -- confirms the user's suspicion directly
+
+Built `src/compute_argo_coverage.py` (full-archive scan, globally deduplicated across the ~9-cycle-file
+replication per 16.1 -- **542,304** unique near-surface Argo profiles found locally, 2021-2025) and
+`src/plot_argo_coverage.py` to compare against the satellite-matched subsets. Saved to
+`data/matchups/argo_coverage.png`.
+
+**Result: Argo coverage is dense and close to globally uniform** (hundreds to 1000+ profiles per 5deg cell
+over the period), including in regions that look sparse in the SMAP-matched (n=32,557) and SMOS-matched
+(n=61,897) panels -- only the most extreme polar margins near ice edges are genuinely Argo-thin. The
+satellite-matched subsets are visibly patchier and lower-density *everywhere*, even in open ocean where raw
+Argo is abundant.
+
+**This reframes 19.1's gaps**: they are not regions where ground truth is fundamentally unavailable -- they
+are regions where the current satellite-matching pipeline (tight 50km/3h window, ~78-81% satellite QC pass
+rate, a few years of study period) hasn't accumulated enough *verified pairs* yet, despite abundant
+underlying Argo data. A wider match window or a longer accumulation period could likely recover much better
+validation density in these regions specifically because Argo itself isn't the bottleneck -- a more
+optimistic framing than "permanently unverifiable."
+
+Side observation: a distinct, unusually dense hotspot around 30-40N, 50-70W (western North Atlantic) in the
+raw Argo coverage -- likely a dedicated research array, not representative of typical open-ocean density.
