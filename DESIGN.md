@@ -637,3 +637,157 @@ to that diagnosis).
 mechanism and a real, if small, duplication bug) even though it didn't move the headline numbers. `--cycle-window`
 is exposed as a CLI flag on `build_matchups.py` for anyone who wants to experiment with wider/narrower search
 windows later.
+
+## 17. Raw Argo retrieval: recovering WMO float ID and real QC
+
+Motivated by 14: obsForge's Argo `PreQC` is unusable (§4) and there's no float ID, blocking clean
+float-based train/test splitting (§6). Investigated pulling from the raw public GDAC directly.
+
+### 17.1 Why delayed-mode Argo for the training/eval target, even though SMAP/SMOS must stay real-time
+
+The project's purpose is real-time operational bias correction, so SMAP/SMOS *inputs* must always be
+real-time -- there's no delayed-mode reprocessing of the satellite side to fall back on operationally. But
+Argo here is the training *label* (ground truth), not an input: the model's job is "given a biased real-time
+satellite retrieval, predict the true near-surface salinity," and "true near-surface salinity" is a fixed
+physical fact that doesn't change based on when Argo's own QC/calibration happened. Delayed-mode Argo is
+simply a more accurate estimate of that same fixed quantity; training against noisier real-time Argo would
+inject Argo's own sensor-drift error into the target for no benefit. Not a leakage concern -- standard
+practice is to use the best available labels even when the deployed model sees noisier real-world inputs.
+Practical rule: prefer delayed-mode (D), fall back to real-time (R/A) only where D isn't yet available
+(delayed-mode processing lags real-time by ~6-12 months; largely moot for our 2021-2023 window since it's
+several years old by now).
+
+### 17.2 Setup and a real dependency bug
+
+`pip install argopy` pulled `erddapy==3.3.0`, which is incompatible with `argopy` 1.4.0 (`ImportError:
+cannot import name '_quote_string_constraints'`) -- broke *all* of argopy's data fetchers, including the
+GDAC one needed here, at import time. Fixed by pinning `erddapy==3.2.1`. Worth remembering if this env is
+rebuilt: `pip install argopy 'erddapy==3.2.1'`, not just `pip install argopy`.
+
+Validated against a real matchup row (SMAP, lat 4.98976, lon -168.84845, 2021-07-02 05:57): argopy's `region()`
+fetcher (mode='standard', which auto-applies delayed-mode-preferred/real-time-fallback -- no need to hand-roll
+that merge) returned the *exact* matching profile -- same lat/lon, true time off by 33s, near-surface salinity
+average 34.7317 vs. our obsForge-derived 34.7318. Confirms our existing near-surface-averaging logic is
+correct, and recovers `PLATFORM_NUMBER` (WMO float ID, 5906681) and real QC (`PSAL_QC=1`, `DATA_MODE='D'`)
+that obsForge's version has neither of.
+
+### 17.3 `region()` doesn't scale to a global bounding box -- pivoted to `ArgoIndex`
+
+A single **1-day, global** near-surface `region()` fetch took ~20 minutes and ~21GB RAM before completing.
+A second attempt (testing whether caching would help) was killed after 13+ minutes with no output at all --
+though it's worth being honest that this was inferred from resource/timing similarity to the first call, not
+confirmed certain it would never have returned (a fair challenge raised mid-session). Either way, scaling this
+to 5 years of global chunks was clearly impractical.
+
+Pivoted to `argopy.ArgoIndex`, which downloads the GDAC's global profile index file *once* rather than
+querying the server per time/region window. Loading the full index (3,371,859 records, all-time, all
+profile types) took **2.88 seconds**. Filtering it locally (no network) to our 2021-2025 window: **853,543
+matching profiles**, in under 5 seconds. Dramatically more scalable regardless of whether the killed
+`region()` call was broken or just slow -- this is now the right tool for bulk index lookups.
+
+Revised plan (not yet implemented): rather than bulk-fetching all 853,543 profiles globally (a separate,
+redundant dataset), nearest-neighbor match our *existing* 32,557 (SMAP) + 61,897 (SMOS) matchup rows against
+the loaded index by lat/lon/date (same collocation technique already built for SMAP/SMOS-vs-Argo) to recover
+WMO ID + file path per row, then fetch only those specific profile files (likely well under 94,454 given
+overlap between the two sensors' shared underlying Argo profiles) -- targeted enrichment of what we have,
+not a bulk pull.
+
+### 17.4 What QC does obsForge vs. the operational DA system actually apply to Argo?
+
+Read the actual source (`NOAA-EMC/obsForge` b2i converter and `NOAA-EMC/GDASApp` DA filter config) rather
+than continue inferring from data alone.
+
+**obsForge's own QC (`utils/b2i/b2iconverter/ioda_variables.py`) is exactly as crude as suspected**: global
+bounds only -- salinity `[0, 45]` PSU, temperature `[-10, 50]`C -- plus basic lat/lon/depth NaN cleaning and
+an ID-pattern filter (`stationID` second digit `== 9`) to separate Argo from other profiling-float types in
+the same raw BUFR "subpfl" tank. `[0,45]` PSU would not have caught the 0.118 PSU stuck-sensor profile found
+in an earlier session (§4) -- confirms `PreQC` being unusable isn't a processing bug, it's simply that no
+real QC is computed at this stage at all.
+
+**Structural finding**: the Argo b2i converter (`bufr2ioda_insitu_profile_argo.py`) reads from WMO GTS BUFR
+messages ("subpfl" tank) -- our entire local Argo archive is **real-time GTS data**, not the GDAC's delayed-
+mode archive. Anything that doesn't transmit via GTS promptly (recovered-after-the-fact data, non-GTS DACs,
+transmission gaps) is simply absent from our local files regardless of QC -- this is the actual source of
+"delayed-mode might have more profiles than we have locally," distinct from any QC question. Also notable:
+raw BUFR *does* carry a WMO platform ID (`stationID` from descriptor `WMOP`) and obsForge's converter reads
+it (uses it for the Argo-vs-other-floats filter above) but does not carry it through into the final IODA
+`MetaData` group -- the float ID is available upstream and simply not surfaced in the files we've been using.
+
+**GDASApp's actual Argo salinity DA filter chain** (`parm/jcb-gdas/observations/marine/insitu_salt_profile_argo.yaml.j2`)
+is far richer than the satellite chain (13), and directly informative for QC we should adopt:
+- **Region-specific salinity bounds**, not one global range: global `[2,41]` PSU, but separately tuned for
+  Red Sea `[2,41]`, Mediterranean `[2,40]` (two sub-boxes), Northwestern European shelves `[0,37]`,
+  Southwestern shelves `[0,38]`, Arctic (lat>=60) `[2,40]`. Real brackish/marginal-sea water is
+  accommodated regionally -- our single global `[20,42]` filter (§4) doesn't do this, and may have been
+  rejecting legitimate low-salinity obs in exactly the shelf/high-latitude regions where basin-level
+  instability already showed up (§12).
+- **A "Spike and Step Check"** (tolerance 0.05 PSU) purpose-built to catch rounded/stair-stepped depth
+  profiles -- precisely the signature of the stuck-sensor artifact found manually in an earlier session.
+  The operational system catches this class of error systematically; our pipeline doesn't.
+- A bathymetry consistency check (reject if reported depth exceeds the model's own seafloor depth there)
+  and background checks (need live GeoVaLs -- same "not available to us" limitation as 13).
+
+**Implication for QC if the profile set is expanded**: use Argo's own native per-obs QC flags (`PSAL_QC`,
+confirmed populated in the raw GDAC data -- our validated test profile had `PSAL_QC=1`) instead of the
+current ad hoc `[20,42]` range + gross-mismatch filter. This is the actual scientific QC assessment Argo
+performs, strictly more principled than inferring thresholds from data. Plan: filter to `PSAL_QC == 1` (good),
+optionally allow `2` (probably good); adopt GDASApp's region-specific bounds as a cheap complementary sanity
+layer; keep the gross-mismatch-vs-satellite check since it serves a different purpose (bad collocation, not
+bad individual obs).
+
+## 18. Float-ID-aware train/val/test split
+
+Decided to do the "narrower thing" first (incorporate the recovered WMO float ID into matching/splitting)
+with the broader profile-set expansion deferred to later -- see the discussion in this session about expected
+payoff: float ID mainly buys evaluation *rigor* (proper no-leakage grouping), not better model performance
+per se, whereas real `PSAL_QC` and (especially) expanding the profile set were judged more likely to move
+actual metrics. This section covers the rigor step.
+
+### 18.1 Implementation
+
+`src/attach_wmo_to_matchups.py`: merges `data/matchups/argo_wmo_lookup.parquet` (17.3's index-matched WMO
+IDs) onto both matchup tables by `(argo_lat, argo_lon, argo_datetime)`, adding a `wmo` column (NaN where
+unmatched). Coverage: **94.9% of SMAP rows, 78.5% of SMOS rows** got a float ID (SMOS lower, consistent with
+its lower index-match rate for 2024-2025 noted in 17.3).
+
+`src/features.py::split_data()` redesigned to be float-aware: compute the naive date-only partition as
+before, then for every row with a known `wmo`, reassign the *entire* float to whichever of train/val/test
+contains its **earliest** in-window observation -- guaranteeing no float ever appears in more than one
+partition. Rows with no recovered float ID (~5% SMAP, ~21% SMOS) keep the naive date-only assignment, relying
+on the existing embargo gaps as their only leakage protection, same as before this change. Embargo-period
+rows are untouched either way -- this reassignment only moves rows *between* train/val/test, never pulls an
+embargo-dropped row back in. Verified directly: zero floats appear in more than one partition, for both
+sensors, after the change.
+
+### 18.2 The cost of doing this properly: val/test collapse in size
+
+| sensor | split | date-only n | float-aware n |
+|---|---|---|---|
+| SMAP | test | 6,124 | **1,035** |
+| SMAP | val | ~5,000s | 1,885 |
+| SMOS | val | ~5,000s | **480** |
+| SMOS | test | 5,212 | 10,592 |
+
+Test-set metrics moved differently per sensor: SMAP's FFANN RMSE barely changed (1.284 -> 1.288) but bias got
+notably *worse* (+0.042 -> +0.339) and correlation improved (0.676 -> 0.768); SMOS's numbers improved across
+the board (RMSE 1.430 -> 1.211, bias 0.135 -> -0.019, corr 0.523 -> 0.562). Given how much smaller and
+differently-composed these test sets now are (SMAP down to just 1,035 rows), **these movements are more
+likely sample-composition noise than genuine model-quality change** -- not a conclusion to lean on either way
+without a larger, more representative evaluation set.
+
+**Why this happens, and why it's not a fixable artifact of the specific rule chosen**: Argo floats have a
+4-5 year typical lifespan. Any float active during the H1/H2 2023 val/test windows was almost certainly
+*already* active back in 2021-2022, so strict no-leakage float grouping pulls nearly every float into train
+regardless of which "earliest partition" rule is used -- val/test end up containing only floats that
+happened to be newly deployed during that specific ~5.5-month window, a small and possibly non-representative
+population, not a random sample of the ocean. This is inherent to the data's true structure (long-lived
+floats, short observation window), not a bug in the reassignment logic.
+
+**This is the direct link to "expanding the data selection later"**: a wider date range would mean more
+calendar time for new floats to appear within each window, growing val/test back toward a usable, more
+representative size. Deferred for now per the plan agreed this session (float ID/rigor first, profile-set
+expansion later).
+
+**Open decision, not yet resolved**: keep this stricter, leak-free split as the new default despite small/
+noisy val/test, or find a compromise (e.g., blocked/rolling CV across multiple date windows per 6, to average
+out the small-sample noise) before trusting comparisons against it.
