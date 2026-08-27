@@ -932,3 +932,67 @@ optimistic framing than "permanently unverifiable."
 
 Side observation: a distinct, unusually dense hotspot around 30-40N, 50-70W (western North Atlantic) in the
 raw Argo coverage -- likely a dedicated research array, not representative of typical open-ocean density.
+
+## 20. Identifying the actual raw SMAP source obsForge ingests
+
+Investigated a specific candidate raw source (PO.DAAC's `SMAP_RSS_L2_SSS_NRT_V6`, produced by Remote Sensing
+Systems) to recover the fields IODA stripped out (14, 17). Found a real schema mismatch: that product's
+variables (`cellat`, `cellon`, `sss_smap`, `iqc_flag`, `time`) don't match anything `Smap2Ioda.h` reads
+(`lat`, `lon`, `smap_sss`, `smap_sss_uncertainty`, `quality_flag`, `row_time`, plus `REV_START_YEAR`/
+`REV_START_DAY_OF_YEAR` attributes) -- and it's also titled "Level 2C", while the converter's `row_time`/
+`REV_START_YEAR` naming is characteristic of swath-level ("Level 2B") data, not a resampled/gridded product
+(RSS's "L2C" is smoothed to ~70km on a fixed per-orbit Earth grid, per its own variable descriptions).
+
+**Resolved definitively, not by inference** -- checked the actual local IODA files' global attributes
+(`obs_source_files`, e.g. `SMAP_L2B_SSS_NRT_39245_A_20220606T230121.h5`), confirmed consistent across cycles
+from 2021, 2022, and 2023. This is genuinely the real raw filename pattern feeding obsForge, not a stale
+converter or a wrong guess. Searching for that exact filename convention (rather than the RSS product) found
+the real source: **`SMAP_JPL_L2B_NRT_SSS_CAP_V5`** -- produced by **JPL itself**, using their own "CAP"
+(Combined Active-Passive) retrieval algorithm, a completely different processing center/algorithm than RSS.
+Confirmed via its Variables tab: exact match to `Smap2Ioda.h`'s expected fields, including `row_time`
+described word-for-word as "Approximate observation time for each row, UTC seconds of day" -- identical to
+the C++ code's own comment.
+
+This product is substantially richer than what IODA retains, and covers essentially all of the phase-2/3
+candidate inputs from 5 and the original project brief:
+- `inc_fore`/`inc_aft`, `azi_fore`/`azi_aft`, `antazi_fore`/`antazi_aft` -- fore/aft look geometry, SMAP's
+  equivalent to Aquarius's multi-beam/horn inputs in Vernieres et al. (SMAP conically scans with fore/aft
+  looks rather than Aquarius's 3 physical horns)
+- `anc_sst` -- ancillary SST (NOAA OI), the SST input from Vernieres et al.
+- `anc_spd`/`anc_dir` -- ancillary wind speed/direction (NCEP), the wind-stress input Trossman & Bayler
+  suggest
+- `smap_spd`, `smap_high_spd`, `smap_high_dir` -- SMAP's own retrieved wind speed/direction, independent of
+  the ancillary field
+- `ice_concentration` -- directly relevant to the high-latitude/ice-edge error hotspot found in 12.2
+- per-polarization, per-look brightness temperatures (`tb_h_fore`/`tb_h_aft`/`tb_v_fore`/`tb_v_aft`)
+
+Access still requires NASA Earthdata Login (14's blocker, unchanged). No SMOS-side equivalent investigation
+done yet -- worth doing the same exercise for whatever raw source feeds `Smos2Ioda.h` before assuming the
+same access situation applies.
+
+## 21. Open architectural question: where does the correction actually run?
+
+Raised directly: is it feasible to train on the rich JPL CAP inputs (20) -- SST, wind, roughness proxies,
+fore/aft look geometry, ascending/descending, ice concentration -- while still being able to apply the
+correction using only the fields already present in the stripped-down SMAP IODA files? Not resolved, and the
+answer depends entirely on an architecture decision that hasn't been made (or at least hasn't been surfaced
+to this project):
+
+- **If the correction runs at/near the raw-to-IODA conversion step** (e.g. folded into `Smap2Ioda.h` or a
+  processing stage sharing its input), all the rich CAP fields are available at exactly the moment the
+  model would need them -- the model's output (corrected SSS) is the only thing that needs to survive into
+  the final IODA file. Fully feasible, no proxies needed.
+- **If the correction is meant to run downstream, as an independent step consuming only the already-produced
+  IODA files** (e.g. a standalone Python tool deliberately decoupled from obsForge's C++ codebase), the rich
+  fields are genuinely gone by that point. Two fallbacks, neither requiring the full architecture change:
+  - Push for obsForge to retain nearly-free fields it already parses and discards -- ascending/descending is
+    the clearest case (`_A`/`_D` is literally in the source filename obsForge already reads).
+  - Use lat/lon/day-of-year climatological proxies for SST/wind/roughness, precomputed once from the rich
+    upstream archive, looked up at both train and deployment time using only what's already in the stripped
+    IODA files. Loses real-time synoptic variability but may recover much of the climatologically-persistent
+    signal (frontal zones, Southern Ocean wind belts) that likely drives a lot of the retrieval bias anyway.
+
+**Not blocking**: regardless of which architecture turns out to be real, training the full rich-feature model
+as a research upper bound (once Earthdata access is sorted out) is valuable on its own -- it quantifies how
+much accuracy is actually at stake, which is exactly the number needed to justify pursuing the richer
+integration or the climatology fallback versus staying with the current lat/lon/season/basin-only model.
