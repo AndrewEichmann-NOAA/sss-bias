@@ -1040,3 +1040,42 @@ warning). Downloaded two real granules from `SMAP_JPL_L2B_NRT_SSS_CAP_V5` for 20
 This fully closes out 20's open item and validates 21/21.1's premise (the rich fields genuinely exist in the
 raw file obsForge already reads) with real downloaded data rather than documentation alone. Next step, not
 yet done: pull a large enough sample to train the rich-feature research upper-bound model discussed in 21.
+
+## 23. Rich-feature matchup table from raw JPL CAP swaths (`src/build_raw_smap_matchups.py`)
+
+Pulled a full week (2022-06-01 to 2022-06-08, 207 orbit files, 2.0GB) of real `SMAP_JPL_L2B_NRT_SSS_CAP_V5`
+granules into `data/raw_smap_cap/` (kept outside git via `data/`'s existing `.gitignore` entry, but persisted
+on disk across sessions rather than left in the scratchpad). Built a matchup table against near-surface Argo
+carrying all the rich per-pixel fields the operational IODA converter currently drops (incidence/azimuth
+angles, brightness temperatures, ancillary wind/SST, ice concentration, retrieval uncertainty -- see 21.1's
+`RICH_FIELDS` list), written to `data/matchups/smap_cap_argo_matchups.parquet`.
+
+Two implementation details that don't apply to `build_matchups.py`'s IODA-based pipeline:
+
+- **Timestamp reconstruction**: raw files have no per-obs absolute timestamp field. `row_time` (UTC seconds
+  of day, varying only along-track) is combined with the file's `REV_START_YEAR`/`REV_START_DAY_OF_YEAR`
+  global attributes to get an absolute datetime per pixel. Verified safe to assume no day-rollover within a
+  single file (each file's `row_time` span is ~1-2h, far short of 86400s).
+- **Fill-value handling**: bypasses netCDF4's auto-masking entirely (`ds.set_auto_mask(False)`) and manually
+  replaces each variable's declared `_FillValue` with NaN, rather than trusting the mask -- continuing the
+  same lesson as 22 and 4/15's Argo fields. One rich field, `anc_swh` (ancillary wave height), turned out to
+  be `_FillValue` for 100% of pixels in this product -- confirmed genuine (not a reading bug) by checking a
+  raw file directly; it survives in the table as an all-NaN column.
+
+**Bug caught before trusting the output**: satellite files aren't chunked into DA cycles the way IODA sss
+files are -- there's no natural "search a window of nearby cycles" structure. A first attempt pooled all
+206k+ QC-pass pixels across all 207 files into one global BallTree and took each Argo obs's single nearest
+neighbor. This found only 51 matches, vs. 310 for the IODA-based `build_matchups.py` pipeline over the
+identical week/settings (50km/3h/QC-pass). Diagnosis: pooling across days means a spatially-closer pixel from
+a *different day's* orbit pass can mask the true same-pass match, which is farther in pure distance but
+correct in time -- exactly the failure mode `build_matchups.py`'s `match_windowed` docstring already warns
+about for cycle-windowed search (15.5-adjacent). Fixed by keeping each orbit file as a separate candidate
+(mirroring `match_windowed`'s per-cycle-candidate design, generalized to carry arbitrary rich columns through
+via a (file, row) index rather than per-column `np.where`): querying every file's own tree per Argo obs and
+keeping the best result that *also* passes the time/gross-error filters, not just the single spatially
+nearest pixel overall. This produced exactly 310 matches -- matching the IODA-based reference count for the
+same window, and specifically the 259 obs that were being silently dropped are the ones whose truly-matching
+pass wasn't the day's spatially closest pixel.
+
+Not yet done: training the rich-feature model on this table and comparing it against the lat/lon/season/basin
+baseline (21's "research upper bound" question) -- this table only builds the inputs.
