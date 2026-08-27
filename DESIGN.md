@@ -1013,3 +1013,30 @@ as a research upper bound (once Earthdata access is sorted out) is valuable on i
 much accuracy is actually at stake, which is exactly the number needed to justify pursuing either the
 converter change or embedding the model in conversion, versus staying with the current lat/lon/season/basin-
 only model.
+
+## 22. Confirmed the raw JPL CAP source end-to-end with real data
+
+Earthdata Login set up (`~/.netrc`, `machine urs.earthdata.nasa.gov`, `chmod 600` -- credentials never passed
+through this assistant). Installed `podaac-data-subscriber`/`podaac-data-downloader` (needed
+`brew install geos` first -- a `shapely` build dependency wasn't present; downgraded `packaging` to 23.2 as a
+side effect, verified this doesn't break xarray/torch/sklearn/pyarrow/matplotlib despite the version-mismatch
+warning). Downloaded two real granules from `SMAP_JPL_L2B_NRT_SSS_CAP_V5` for 2022-06-07.
+
+**Every open question from 20 is now confirmed directly against real data, not inferred:**
+- Variable names, `phony_dim_0`/`phony_dim_1` dimensions: exact match to `Smap2Ioda.h`.
+- `REV_START_YEAR`/`REV_START_DAY_OF_YEAR` global attributes (unverifiable from the PO.DAAC web page, since
+  it only lists variables, not attributes): present and correct (2022, day-of-year 158).
+- `row_time` = 20112s for the first row exactly equals `REV_START_TIME` (05:35:12 UTC) converted to seconds
+  since midnight -- confirms the "UTC seconds of day" documentation is accurate.
+- `quality_flag` values (`0, 2, 64, 66, 529, 641, 643, 705, 707, ...`) overlap almost entirely with the
+  `PreQC` values found in local IODA files early in this project -- closes the loop: local `PreQC` really is
+  this exact raw bitmask, passed through unmodified, exactly as the converter code shows.
+- `anc_sst` (273-310K, physically sensible), `anc_spd`/`anc_dir`, `ice_concentration` (0-6.1% in this sample),
+  `inc_fore`/`azi_fore`: all genuinely populated with real values, not placeholders. Note: like Argo's
+  `salinity` and `originalDateTime` (4, 15), some of these fields have a real `_FillValue` (`-9999.0`) that
+  isn't always caught by default masked-array handling -- checked with `np.ma.filled() + np.isfinite()`
+  rather than trusting the mask alone, same lesson as those earlier fields.
+
+This fully closes out 20's open item and validates 21/21.1's premise (the rich fields genuinely exist in the
+raw file obsForge already reads) with real downloaded data rather than documentation alone. Next step, not
+yet done: pull a large enough sample to train the rich-feature research upper-bound model discussed in 21.
