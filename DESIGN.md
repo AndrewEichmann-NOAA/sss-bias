@@ -984,15 +984,32 @@ to this project):
   the final IODA file. Fully feasible, no proxies needed.
 - **If the correction is meant to run downstream, as an independent step consuming only the already-produced
   IODA files** (e.g. a standalone Python tool deliberately decoupled from obsForge's C++ codebase), the rich
-  fields are genuinely gone by that point. Two fallbacks, neither requiring the full architecture change:
-  - Push for obsForge to retain nearly-free fields it already parses and discards -- ascending/descending is
-    the clearest case (`_A`/`_D` is literally in the source filename obsForge already reads).
-  - Use lat/lon/day-of-year climatological proxies for SST/wind/roughness, precomputed once from the rich
-    upstream archive, looked up at both train and deployment time using only what's already in the stripped
-    IODA files. Loses real-time synoptic variability but may recover much of the climatologically-persistent
-    signal (frontal zones, Southern Ocean wind belts) that likely drives a lot of the retrieval bias anyway.
+  fields are genuinely gone by that point -- but this is a much smaller problem than it first appears (21.1).
+
+### 21.1 Refinement: retaining the raw fields in IODA is a minor code change, not a rearchitecture
+
+Checked directly against `Smap2Ioda.h`'s actual code rather than assuming: every field it currently extracts
+uses the identical trivial pattern `ncFile.getVar("<name>").getVar(buffer)` -- `lat`, `smap_sss`,
+`quality_flag`, etc. are not special; `anc_sst`, `anc_spd`, `anc_dir`, `inc_fore`/`inc_aft`, `ice_concentration`
+are just other variables in the same raw file, currently simply not read. The base `IodaVars` class already
+has a `floatMetadataNames` vector for exactly this purpose -- SMAP's converter currently sets it to `{}`, i.e.
+the infrastructure for carrying extra metadata into the IODA output already exists and is unused, not absent.
+
+One exception worth being precise about: ascending/descending is not a netCDF variable at all -- it's
+embedded in the raw filename itself (`_A_`/`_D_` in `SMAP_L2B_SSS_NRT_..._A_...`). Retaining it needs a small
+filename-parsing addition, a different (still easy) code path than the rest.
+
+**This adds a third, likely-best option to 21's fork**: keep the correction model downstream and decoupled
+from obsForge's C++ codebase (simpler to iterate on as ML code, no need to embed model inference in the
+conversion pipeline), while making a one-time, additive change to `Smap2Ioda.h` (and presumably `Smos2Ioda.h`)
+to carry the needed raw fields into the IODA output as new metadata variables. This gets full data richness
+at the correction step without either embedding model inference inside the C++ pipeline, or falling back to
+climatology approximations for genuinely observation-specific fields. The climatology-proxy fallback noted
+above is still worth keeping in mind if extending the converter turns out to be impractical for institutional
+reasons, but it's no longer the default answer.
 
 **Not blocking**: regardless of which architecture turns out to be real, training the full rich-feature model
 as a research upper bound (once Earthdata access is sorted out) is valuable on its own -- it quantifies how
-much accuracy is actually at stake, which is exactly the number needed to justify pursuing the richer
-integration or the climatology fallback versus staying with the current lat/lon/season/basin-only model.
+much accuracy is actually at stake, which is exactly the number needed to justify pursuing either the
+converter change or embedding the model in conversion, versus staying with the current lat/lon/season/basin-
+only model.
