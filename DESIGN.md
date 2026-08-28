@@ -1079,3 +1079,37 @@ pass wasn't the day's spatially closest pixel.
 
 Not yet done: training the rich-feature model on this table and comparing it against the lat/lon/season/basin
 baseline (21's "research upper bound" question) -- this table only builds the inputs.
+
+## 24. Rich-feature POC results: 1 week vs. 12 weeks -- the 1-week result was mostly noise
+
+`src/train_rich_features_poc.py` trains two FFANNs on an identical random 70/15/15 split of the rich matchup
+table: one restricted to the operational baseline's feature set (`sat_sss`, lat, lon, season, basin), one with
+the rich JPL CAP fields added, so any RMSE gap is attributable to the extra fields rather than to different
+data or splits.
+
+**1 week** (310 matches, test n=47): rich RMSE 0.595 vs. baseline-features RMSE 0.628 -- looked like a ~5%
+improvement.
+
+**12 weeks** (2022-06-01 to 2022-08-24, 1882 raw files, 3550 matches, test n=533, after extending the download
+-- see below): rich RMSE 1.349 vs. baseline-features RMSE 1.371 -- still an improvement, same direction, but
+only ~1.6%, an order of magnitude smaller than the 1-week number suggested. (Absolute RMSE is also much higher
+than the 1-week run's -- not a regression, just a much more representative, harder-to-fit sample; the 1-week
+window's 47-row test set was too small to trust either its RMSE level or the size of the gap between models.)
+Confirms the concern raised when the 1-week result first came back: a 47-row test set can't resolve an effect
+this small, and it didn't -- the true gap is real but modest, not the ~5% first glimpsed.
+
+Caveat that still applies at 12 weeks: the whole window is boreal summer 2022, so this doesn't yet test
+whether the gain holds across seasons the way the operational baseline's train/val/test split (spanning
+2021-2023) is designed to. That requires the full-year pull discussed when 12 weeks was chosen as a cheaper
+checkpoint.
+
+**Bug caught along the way**: `sat_ice_concentration` is ~constant 0 at these (mostly ice-free, mid-latitude)
+float locations -- not bit-exactly constant, so its train-set std came out to `5.6e-19` rather than exactly 0,
+and the `Standardizer`'s `std == 0` guard didn't catch it. Dividing by that near-zero std blew any val/test row
+differing by float noise up to nonsense (RMSE ~129,000 on the first run). Fixed by thresholding the guard
+(`std < 1e-8`) instead of checking exact equality.
+
+**Download note**: the 11 additional weeks (1677 files) had to be resumed once -- the download stalled
+mid-run (TCP connection stayed `ESTABLISHED` but no bytes moved for 10+ minutes) after ~260 files. Killed and
+re-ran the identical command; `podaac-data-downloader` skips files already present on disk, so this picked up
+exactly where it left off with no lost progress or re-downloaded data.
