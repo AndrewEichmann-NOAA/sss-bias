@@ -1150,6 +1150,27 @@ cost ~19x more compute, which is what was observed. Output is still correct (val
 baseline for the 12-week window, DESIGN.md 23), just not efficient -- worth adding a date-proximity pre-filter
 before extending this further (e.g. to multiple years).
 
+### 25.1 Fixed: sort Argo obs by time, binary-search each file's relevant window
+
+Each raw file spans only ~1-2h, so an Argo obs more than `max_time_delta` outside a file's own `[min, max]`
+datetime range can never pass the time filter regardless of distance -- querying the tree for it is pure
+waste. Fix: sort all Argo obs by datetime once, then for each file, `np.searchsorted` the sorted array for
+the small window `[file.min - max_time_delta, file.max + max_time_delta]` and only query/update that subset.
+This drops each file's relevant-candidate count to roughly constant regardless of total span (rather than
+scaling with the full Argo table), turning the match step from `O(span^2)` into `O(span)`.
+
+One bug on the way to the fix: `file_datetime.min() - max_time_delta` (a `datetime64[s]` minus a
+`pd.Timedelta`) silently produces a pandas `Timestamp`, not a numpy `datetime64` -- `np.searchsorted` can't
+compare that scalar type against the sorted `datetime64[ns]` Argo array (`TypeError: '<' not supported between
+instances of 'int' and 'Timestamp'`). Fixed by wrapping the window bounds in `np.datetime64(...)` explicitly
+rather than relying on numpy to coerce a pandas type.
+
+Verified correct, not just faster: re-ran both the 12-week and full-year builds after the fix and got exactly
+the same match counts (3550 and 14705) with byte-identical distance/time-delta summary statistics as the
+pre-fix runs. Real-world speedup: the full-year build dropped from ~2h47m to **3m51s** -- about 43x, and now
+dominated by file-loading I/O rather than the matching step, consistent with the fix turning quadratic cost
+into linear.
+
 **The season-held-out result** (`train_rich_features_poc.py --split chronological`, now the default once a
 table spans multiple seasons): train on 2022-06 through 2023-01 (summer through early winter), test on 2023-04
 onward (spring -- a season absent from training), n=2441 test rows:

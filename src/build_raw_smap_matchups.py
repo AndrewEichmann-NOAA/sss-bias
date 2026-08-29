@@ -186,6 +186,17 @@ def match_to_argo(argo_df, file_dfs, max_dist_km, max_time_delta, max_abs_diff):
     to per-orbit-file candidates and generalized to carry arbitrary satellite
     columns (the rich fields) through via a (file, local row) index instead of
     per-column np.where accumulation.
+
+    Each file only spans ~1-2h, so an Argo obs more than max_time_delta outside
+    a file's own [min, max] datetime range can never pass the time filter --
+    querying the tree for it is wasted work. Without pruning those out first,
+    cost is O(n_files x n_argo): both grow linearly with the requested date
+    span, so total cost grows quadratically (DESIGN.md 25: a full year took
+    ~2h47m this way, ~19x the 12-week run's cost for a ~4.35x longer span).
+    Argo obs are sorted once by datetime so each file can binary-search its
+    own relevant window instead of scanning every Argo obs -- this drops the
+    per-file candidate count to ~constant regardless of total span, making
+    the whole match O(n_files) i.e. linear in the date range.
     """
     argo_df = argo_df.reset_index(drop=True)
     argo_rad = np.radians(argo_df[['lat', 'lon']].to_numpy())
@@ -197,26 +208,44 @@ def match_to_argo(argo_df, file_dfs, max_dist_km, max_time_delta, max_abs_diff):
     best_file_idx = np.full(n, -1, dtype=np.int64)
     best_local_idx = np.full(n, -1, dtype=np.int64)
 
+    order = np.argsort(argo_datetime)
+    sorted_datetime = argo_datetime[order]
+
     for fi, df in enumerate(file_dfs):
+        file_datetime = df['datetime'].to_numpy()
+        # file_datetime is datetime64[s]; subtracting a pd.Timedelta yields a
+        # pandas Timestamp, not a numpy datetime64, which np.searchsorted
+        # can't compare against sorted_datetime's datetime64[ns] -- convert
+        # back explicitly rather than relying on numpy to coerce it.
+        window_start = np.datetime64(file_datetime.min() - max_time_delta)
+        window_end = np.datetime64(file_datetime.max() + max_time_delta)
+
+        lo = np.searchsorted(sorted_datetime, window_start, side='left')
+        hi = np.searchsorted(sorted_datetime, window_end, side='right')
+        if lo >= hi:
+            continue
+        positions = order[lo:hi]
+
         tree = BallTree(np.radians(df[['lat', 'lon']].to_numpy()), metric='haversine')
-        dist_rad, idx = tree.query(argo_rad, k=1)
+        dist_rad, idx = tree.query(argo_rad[positions], k=1)
         dist_km = dist_rad[:, 0] * EARTH_RADIUS_KM
         idx = idx[:, 0]
 
         cand_sss = df['sss'].to_numpy()[idx]
-        cand_dt = df['datetime'].to_numpy()[idx]
-        time_delta = np.abs(argo_datetime - cand_dt)
-        abs_diff = np.abs(cand_sss - argo_salinity)
+        cand_dt = file_datetime[idx]
+        time_delta = np.abs(argo_datetime[positions] - cand_dt)
+        abs_diff = np.abs(cand_sss - argo_salinity[positions])
 
         valid = (dist_km <= max_dist_km) & (time_delta <= max_time_delta) & (abs_diff <= max_abs_diff)
         cand_dist = np.where(valid, dist_km, np.inf)
 
-        improve = cand_dist < best_dist
+        current_best = best_dist[positions]
+        improve = cand_dist < current_best
         if not improve.any():
             continue
-        best_dist = np.where(improve, cand_dist, best_dist)
-        best_file_idx = np.where(improve, fi, best_file_idx)
-        best_local_idx = np.where(improve, idx, best_local_idx)
+        best_dist[positions] = np.where(improve, cand_dist, current_best)
+        best_file_idx[positions] = np.where(improve, fi, best_file_idx[positions])
+        best_local_idx[positions] = np.where(improve, idx, best_local_idx[positions])
 
     matched_mask = np.isfinite(best_dist)
     matched_positions = np.nonzero(matched_mask)[0]
