@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-Small proof-of-concept: does the rich JPL CAP feature set (DESIGN.md 21's
-"research upper bound" question) do anything for bias correction, trained on
-the one-week rich matchup table (data/matchups/smap_cap_argo_matchups.parquet,
-310 rows -- see DESIGN.md 23)?
-
-This is NOT a real comparison against the operational baseline (train_baseline.py
-uses ~20k training rows from 2.5 years; this uses ~217 from one week and one
-random split, not train_baseline.py's chronological/float-aware split -- there's
-no other way to split a single week meaningfully). Treat results as a sanity
-check that the rich features are minimally wired up and directionally useful,
-not as a number to quote for the converter-change decision in DESIGN.md 21.
+Proof-of-concept: does the rich JPL CAP feature set (DESIGN.md 21's "research
+upper bound" question) do anything for bias correction, trained on the rich
+matchup table (data/matchups/smap_cap_argo_matchups.parquet -- see DESIGN.md
+23/24 for how this table's size grew from 310 rows/1 week to 14,705 rows/1
+year)?
 
 Trains two FFANNs on an identical split: one restricted to the same feature
 set as the operational baseline (sat_sss, sat_lat, lon, season, basin), one
 with the rich per-pixel fields added, so any difference is attributable to
-the extra fields rather than to different data/splits.
+the extra fields rather than to different data/splits. Defaults to a
+chronological split (earlier months train, later months test) once the table
+spans multiple seasons -- the whole reason for pulling a full year was to
+check the rich-feature gain isn't just an artifact of training and testing
+within the same season's conditions.
 """
+
+import argparse
 
 import numpy as np
 import pandas as pd
@@ -83,6 +83,22 @@ def add_features(df):
     return df
 
 
+def chronological_split(df, train_end='2023-01-31', val_end='2023-03-31', date_col='sat_datetime'):
+    """Split by date, train on the earlier months and test on later ones --
+    the point of pulling a full year (DESIGN.md 24) was specifically to test
+    whether the rich-feature gain survives a train/test split across
+    different seasons, not just a bigger random split of a single season.
+    Default boundaries put summer-through-early-winter 2022 in train,
+    late-winter 2023 in val, and spring 2023 (a season absent from train) in
+    test -- roughly a 68/15/16 split of the full-year table.
+    """
+    dates = df[date_col]
+    train = df[dates <= train_end].reset_index(drop=True)
+    val = df[(dates > train_end) & (dates <= val_end)].reset_index(drop=True)
+    test = df[dates > val_end].reset_index(drop=True)
+    return train, val, test
+
+
 def random_split(df, train_frac=0.7, val_frac=0.15, seed=0):
     """70/15/15 random split. Not chronological/float-aware like features.py's
     split_data() -- with all 310 rows from a single week, there's no meaningful
@@ -122,12 +138,22 @@ def fit_and_eval_ffann(feature_cols, train, val, test, label):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--split', choices=['chronological', 'random'], default='chronological',
+                         help='chronological (default): train on earlier months, test on later ones, '
+                              'to check the rich-feature gain survives a season change (DESIGN.md 24). '
+                              'random: 70/15/15 random split (only meaningful for a single-season table).')
+    args = parser.parse_args()
+
     df = pd.read_parquet(MATCHUPS_PATH)
     df = add_features(df)
-    print(f"Loaded {len(df)} matchups")
+    print(f"Loaded {len(df)} matchups, {df['sat_datetime'].min()} to {df['sat_datetime'].max()}")
 
-    train, val, test = random_split(df)
-    print(f"train={len(train)} val={len(val)} test={len(test)}")
+    if args.split == 'chronological':
+        train, val, test = chronological_split(df)
+    else:
+        train, val, test = random_split(df)
+    print(f"split={args.split}  train={len(train)} val={len(val)} test={len(test)}")
 
     results = {}
 
@@ -152,7 +178,7 @@ def main():
     # --- FFANN, rich feature set (research upper bound) ---
     results['ffann_rich_features'] = fit_and_eval_ffann(RICH_FEATURES, train, val, test, 'rich features')
 
-    print(f"\n=== Rich-feature POC test-set results (n={len(test)}, random 70/15/15 split, seed=0) ===")
+    print(f"\n=== Rich-feature POC test-set results (n={len(test)}, {args.split} split) ===")
     print(f"{'method':<26}{'n':>6}{'rmse':>10}{'bias':>10}{'corr':>10}")
     for name, m in results.items():
         print(f"{name:<26}{m['n']:>6}{m['rmse']:>10.4f}{m['bias']:>10.4f}{m['corr']:>10.4f}")

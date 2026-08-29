@@ -1113,3 +1113,58 @@ differing by float noise up to nonsense (RMSE ~129,000 on the first run). Fixed 
 mid-run (TCP connection stayed `ESTABLISHED` but no bytes moved for 10+ minutes) after ~260 files. Killed and
 re-ran the identical command; `podaac-data-downloader` skips files already present on disk, so this picked up
 exactly where it left off with no lost progress or re-downloaded data.
+
+## 25. Full year (2022-06-01 to 2023-06-01): a real season-held-out answer, and a genuine outage
+
+Extended the download to a full year: 8,937 raw files, 88GB, 14,705 Argo matches -- a 4.15x increase over the
+12-week table's 3,550, roughly tracking the ~4.35x longer time span (a bit less, because of the gap below).
+
+**Real SMAP outage found, not a bug**: the Aug-Sep 2022 chunk returned only 80 files instead of the expected
+~850 for a normal month. Checked several other months (Sep-Oct 2022, Jan 2023, May 2023) for comparison -- all
+normal (~830-890 files) -- so this was isolated, not a retention-policy artifact. Root cause confirmed via web
+search: **SMAP entered spacecraft safe mode on 2022-08-08** (cause never publicly detailed beyond "the Project
+team is investigating the cause of the anomaly"), and NASA's own dataset-release announcement states "No SMAP
+salinity data were available from 08/09/2022 - 10/06/2022, as SMAP was not in science mode or flying in its
+nominal orbit during that time." This matches what the archive actually shows almost exactly (a handful of
+files Sept 21-23, likely early recovery downlinks, then a return to normal cadence). The eventual matchup
+table carries this as a real ~2-month-thin patch, which is correct behavior, not something to fix.
+
+**36 silently-corrupted downloads found and fixed**: after the full download finished cleanly (0 reported
+failures across all 10 chunks), a full-file validation pass (opening every file and reading `smap_sss`) found
+36 files (0.4%) that were truncated -- file sizes from 16KB up to just under the normal ~10.3MB, scattered
+across Oct 2022 through May 2023, most likely transient connection resets that completed the HTTP request but
+not the full byte stream, which `podaac-data-downloader` doesn't check (no checksum/size verification, only
+"did the request not raise"). Fixed the same way as the earlier stall: delete the corrupt files, re-run the
+full-range download command, and it re-fetched exactly the missing 36 (plus 8 boundary files the monthly
+chunking had skipped) while skipping the ~8,893 good ones. Re-validated after: 0 bad files. Lesson for any
+future large `podaac-data-downloader` pull: always validate file integrity after "0 failures" is reported --
+that count is necessary but not sufficient.
+
+**Quadratic runtime discovered in `build_raw_smap_matchups.py`'s matching step**: the full-year matchup build
+took ~2h47m, far more than linear scaling from the 12-week run's runtime would suggest. Cause: `match_to_argo`
+checks every Argo observation against every raw orbit file's BallTree, regardless of whether that file's date
+could possibly be within the 3h match window -- there's no date-based candidate pruning the way
+`build_matchups.py`'s cycle-windowed search has. Since both the number of files and the number of Argo obs
+grow linearly with the requested date span, total cost is `O(files x argo) = O(span^2)`: a ~4.35x longer span
+cost ~19x more compute, which is what was observed. Output is still correct (validated against the IODA
+baseline for the 12-week window, DESIGN.md 23), just not efficient -- worth adding a date-proximity pre-filter
+before extending this further (e.g. to multiple years).
+
+**The season-held-out result** (`train_rich_features_poc.py --split chronological`, now the default once a
+table spans multiple seasons): train on 2022-06 through 2023-01 (summer through early winter), test on 2023-04
+onward (spring -- a season absent from training), n=2441 test rows:
+
+| method | rmse | bias | corr |
+|---|---|---|---|
+| raw | 1.536 | +0.272 | 0.524 |
+| constant bias | 1.512 | -0.023 | 0.524 |
+| linear regression | 1.405 | +0.086 | 0.554 |
+| FFANN, baseline features | 1.345 | +0.067 | 0.603 |
+| FFANN, rich features | **1.299** | +0.022 | **0.637** |
+
+Rich features beat the baseline-feature FFANN by ~3.4% RMSE and a clearer correlation gap (0.637 vs. 0.603) --
+bigger than the 12-week random-split gain (1.6%) and, more importantly, this is the first result where the
+gain is measured on a season the model never saw in training. This is a real (if still not final -- one
+year, one train/test boundary, no float-ID leakage check unlike the operational baseline's split) answer to
+21's research-upper-bound question: the rich JPL CAP fields carry real, generalizing signal beyond
+lat/lon/season/basin, supporting the case for the one-time additive change to `Smap2Ioda.h` discussed in 21.1.
