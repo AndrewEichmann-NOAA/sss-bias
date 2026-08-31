@@ -1292,3 +1292,23 @@ JPL CAP fields from 21-25), and the longest window tested (21 months) still does
 phase transition or a detected recalibration-regime boundary (`tb_h_bias_adj`/`tb_v_bias_adj` step-change
 detection from 26 is still not done). Natural next step once the archive extends further (26.1's overnight
 pull, in progress): add more origins spanning further into 2024-2026 and re-run.
+
+### 26.3 Recalibration-regime check: no step-change found over the 2-year archive
+
+`src/plot_tb_calibration_timeseries.py` runs the empirical check proposed in 26: weekly mean +/- std of
+`sat_tb_h_bias_adj`/`sat_tb_v_bias_adj` (the JPL CAP algorithm's own applied TB bias-adjustment terms) across
+the full Argo-matchup table (31,601 obs, continuous weekly coverage), flagging any week whose mean jumps by
+more than 3 pooled-std from the previous week as a step-change candidate.
+
+**Result: zero candidates flagged, in either polarization, across the full 2022-06 to 2024-05 span.** The
+time series instead shows a smooth, roughly annual oscillation (troughs around Sep-Oct, peaks around
+May-Jun, in both 2022-2023 and 2023-2024) -- consistent with the bias-adjustment term compensating for
+something seasonal (SST- or wind-correlated, most likely), not a discrete recalibration event. No visible
+discontinuity coincides with either the Aug-Oct 2022 safe-mode gap or the Dec 2023 gap (25/26.1) -- the wider
+error bands right after each gap just reflect fewer/sparser matches in those weeks, not a level shift.
+
+Caveats: this is a coarse check (weekly aggregation, a 3-sigma heuristic rather than a rigorous changepoint
+test, and the Argo-matched subsample rather than the full raw archive) -- a subtle or short-lived
+recalibration could still be masked by this level of aggregation. But at this resolution, over 2 years,
+there's no evidence of the instrument-level drift that would argue against 26.2's "use all available
+history" conclusion.
