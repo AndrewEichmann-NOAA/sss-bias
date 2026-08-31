@@ -83,14 +83,17 @@ def add_features(df):
     return df
 
 
-def chronological_split(df, train_end='2023-01-31', val_end='2023-03-31', date_col='sat_datetime'):
+def chronological_split(df, train_end='2023-12-31', val_end='2024-02-29', date_col='sat_datetime'):
     """Split by date, train on the earlier months and test on later ones --
     the point of pulling a full year (DESIGN.md 24) was specifically to test
     whether the rich-feature gain survives a train/test split across
     different seasons, not just a bigger random split of a single season.
-    Default boundaries put summer-through-early-winter 2022 in train,
-    late-winter 2023 in val, and spring 2023 (a season absent from train) in
-    test -- roughly a 68/15/16 split of the full-year table.
+    With 2 years now available (DESIGN.md 26.1), default boundaries put a
+    full annual cycle (2022-06 through 2023-12) in train, so every season
+    appears at least once, then test on spring 2024 -- a repeat occurrence
+    of a season train has already seen, but a full year later. This checks
+    year-over-year consistency rather than first-time-ever season transfer,
+    which matters more for a model meant to run continuously across years.
     """
     dates = df[date_col]
     train = df[dates <= train_end].reset_index(drop=True)
@@ -134,7 +137,7 @@ def fit_and_eval_ffann(feature_cols, train, val, test, label):
     with torch.no_grad():
         resid_pred_test = model(torch.tensor(X_test, dtype=torch.float32)).numpy()
     pred = test['sat_sss'].to_numpy(dtype=np.float64) + resid_pred_test
-    return compute_metrics(pred, test[TARGET_COLUMN])
+    return compute_metrics(pred, test[TARGET_COLUMN]), pred
 
 
 def main():
@@ -148,6 +151,16 @@ def main():
     df = pd.read_parquet(MATCHUPS_PATH)
     df = add_features(df)
     print(f"Loaded {len(df)} matchups, {df['sat_datetime'].min()} to {df['sat_datetime'].max()}")
+
+    # A handful of pixels (2-7 out of ~19k in the test split) pass QC
+    # (quality_flag == 0) but still have a NaN brightness temperature --
+    # only surfaced now that the test set is large enough to include one.
+    # Drop them from both features and target consistently rather than
+    # patching around NaNs downstream.
+    n_before = len(df)
+    df = df.dropna(subset=RICH_FEATURES).reset_index(drop=True)
+    if len(df) < n_before:
+        print(f"Dropped {n_before - len(df)} rows with NaN in a rich feature (QC-passed but incomplete)")
 
     if args.split == 'chronological':
         train, val, test = chronological_split(df)
@@ -173,15 +186,32 @@ def main():
     results['linear_regression'] = compute_metrics(lr_model.predict(X_test), test[TARGET_COLUMN])
 
     # --- FFANN, operational (baseline) feature set ---
-    results['ffann_baseline_features'] = fit_and_eval_ffann(BASELINE_FEATURES, train, val, test, 'baseline features')
+    results['ffann_baseline_features'], pred_baseline = fit_and_eval_ffann(
+        BASELINE_FEATURES, train, val, test, 'baseline features')
 
     # --- FFANN, rich feature set (research upper bound) ---
-    results['ffann_rich_features'] = fit_and_eval_ffann(RICH_FEATURES, train, val, test, 'rich features')
+    results['ffann_rich_features'], pred_rich = fit_and_eval_ffann(
+        RICH_FEATURES, train, val, test, 'rich features')
 
     print(f"\n=== Rich-feature POC test-set results (n={len(test)}, {args.split} split) ===")
     print(f"{'method':<26}{'n':>6}{'rmse':>10}{'bias':>10}{'corr':>10}")
     for name, m in results.items():
         print(f"{name:<26}{m['n']:>6}{m['rmse']:>10.4f}{m['bias']:>10.4f}{m['corr']:>10.4f}")
+
+    # Row-level test predictions (with lat/lon) for geographic plotting --
+    # mirrors phase1_test_predictions_<sensor>.parquet's role for the
+    # IODA-based pipeline (see plot_geographic_errors.py).
+    predictions = pd.DataFrame({
+        'sat_lat': test['sat_lat'].to_numpy(),
+        'sat_lon': test['sat_lon'].to_numpy(),
+        'sat_sss': test['sat_sss'].to_numpy(),
+        'argo_salinity': test[TARGET_COLUMN].to_numpy(),
+        'pred_ffann_baseline': pred_baseline,
+        'pred_ffann_rich': pred_rich,
+    })
+    predictions_path = '/Users/afeman/Desktop/work/sss-bias/data/matchups/cap_test_predictions.parquet'
+    predictions.to_parquet(predictions_path, index=False)
+    print(f"\nSaved row-level test predictions to {predictions_path}")
 
 
 if __name__ == '__main__':
