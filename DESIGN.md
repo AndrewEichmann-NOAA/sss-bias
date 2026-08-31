@@ -1256,3 +1256,39 @@ Two more real, confirmed gaps found (in addition to the Aug-Oct 2022 safe-mode g
 - One additional silent corruption (1 file) was introduced by killing the runaway wide-range backfill
   mid-transfer -- caught by the same full-archive validation pass used throughout this project, then fixed
   with one more narrow-range re-fetch. Final state: 18,353 files, 0 bad, confirmed by validating every file.
+
+### 26.2 First window-length/recency result: more history helped at every origin tested, no sign of staleness yet
+
+`src/test_training_window_sweep.py` runs the first real version of 26's proposed test: for each of 3 origin
+dates (2023-09-01, 2023-12-01, 2024-03-01), trains the operational baseline-feature FFANN on several trailing
+window lengths (3mo, 6mo, 12mo, all-available-history) all ending at that origin, and evaluates every one of
+them on the SAME fixed 2-month test period immediately after -- holding the test period fixed isolates window
+length/recency from test-period difficulty, which a single train/test split can't do.
+
+RMSE by window length x origin (from the run committed alongside this entry):
+
+| window | 2023-09-01 origin | 2023-12-01 origin | 2024-03-01 origin |
+|---|---|---|---|
+| 3mo | 1.533 | 1.263 | 1.684 |
+| 6mo | 1.449 | 1.095 | 1.274 |
+| 12mo | 1.408 | 1.059 | 1.171 |
+| all-history | **1.382** | **1.044** | 1.173 |
+
+At all 3 origins, RMSE improves monotonically as the window grows -- going all the way back to the start of
+the archive (up to 21 months at the last origin) never hurt, and mostly helped substantially over shorter
+windows. The only near-tie is 12mo vs. all-history at the last origin (1.171 vs. 1.173), suggesting diminishing
+returns past ~12 months rather than active harm from older data. Bias is even more telling: the 3-month window
+at the last origin has bias -0.96 PSU vs. -0.11 for the 12-month window at the same origin -- too little
+training data isn't just noisier, it's poorly calibrated.
+
+This is a real, if preliminary, answer to 26's question: across a 2-year span that already contains the
+Aug-2022 safe-mode gap, the Dec-2023 gap, and a La Nina-to-El Nino transition, there is **no evidence yet**
+that a rolling/recency-weighted window beats using all available history -- "use everything downloaded so
+far" looks like the right default, not a risk, at least at this scale.
+
+Caveats before trusting this for the operational decision: only 3 origins (not enough to rule out this being
+specific to these particular test windows), only the baseline feature set (not yet repeated with the rich
+JPL CAP fields from 21-25), and the longest window tested (21 months) still doesn't reach a second full ENSO
+phase transition or a detected recalibration-regime boundary (`tb_h_bias_adj`/`tb_v_bias_adj` step-change
+detection from 26 is still not done). Natural next step once the archive extends further (26.1's overnight
+pull, in progress): add more origins spanning further into 2024-2026 and re-run.
