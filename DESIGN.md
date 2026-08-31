@@ -1189,3 +1189,70 @@ gain is measured on a season the model never saw in training. This is a real (if
 year, one train/test boundary, no float-ID leakage check unlike the operational baseline's split) answer to
 21's research-upper-bound question: the rich JPL CAP fields carry real, generalizing signal beyond
 lat/lon/season/basin, supporting the case for the one-time additive change to `Smap2Ioda.h` discussed in 21.1.
+
+## 26. Operational deployment question: how much history, and does it go stale?
+
+Raised directly: for a real-time DA bias-correction model, is "use all available data up to today" actually
+the right training strategy, or does secular drift (instrument recalibration, algorithm-version changes,
+ENSO-scale ocean variability, the Aug-2022 safe-mode discontinuity already found in 22/25) argue for a
+recency-weighted or rolling window instead? Conclusion reached by discussion, not yet implemented:
+
+- The rigorous version of "try multiple window lengths" needs to separate two axes that are easy to
+  conflate: training-window **length** (does more history help, holding recency fixed?) and **recency gap**
+  to the test period (does old data actively hurt, holding length fixed?). A single train/test split (like
+  25's) can't distinguish these.
+- A proper test needs **walk-forward validation with multiple training origins** (train ending at several
+  different dates, not just one), not a single boundary -- otherwise "the trailing-year choice works" and
+  "we got lucky with this particular season boundary" are indistinguishable.
+- **Recalibration-regime segmentation** (training only within a period of stable instrument calibration,
+  detected empirically from `tb_h_bias_adj`/`tb_v_bias_adj` step-changes rather than relying solely on public
+  announcements, which don't always exist -- see below) is a complementary idea to a time-window, not a
+  replacement: it addresses instrument-level drift specifically, not ocean-state/climate-scale drift (e.g.
+  ENSO phase), which a calendar window still helps with even within one calibration regime.
+- This kind of test needs more than one year: multiple training origins each need their own trailing history
+  plus a subsequent test period, and testing across genuinely different ocean-climate states (not just
+  calendar seasons) needs data spanning more than one ENSO phase -- 2022-2023 was a La Nina-to-El Nino
+  transition, so a single year sits mostly within one phase.
+
+This motivated pulling a second year (below). The actual window-length/recency/regime-detection experiments
+are not yet built -- this section records the reasoning, not results.
+
+### 26.1 Second year pulled (2023-06-01 to 2024-06-01): two more real gaps, one undocumented
+
+Total archive is now 2 years (2022-06-01 to 2024-06-01), 18,353 files, 192GB, 31,601 Argo matches (rebuilt
+with the now-linear-time matcher from 25.1 in 8 minutes -- roughly 2x the 1-year build's time for 2x the
+data, confirming the fix scales linearly rather than quadratically, not just working on the original case).
+
+Two more real, confirmed gaps found (in addition to the Aug-Oct 2022 safe-mode gap from 22/25):
+
+- **Dec 9-27, 2023** (~19 days): confirmed via direct file-date inspection (only 308 files found for the
+  whole month vs. the normal ~830-890). Unlike the 2022 safe-mode event, **no public documentation found** --
+  checked PO.DAAC's own announcements page directly for Nov-Dec 2023 and found nothing about an outage
+  (only an unrelated Dec 21 dataset release). Logged as "gap confirmed, cause unknown," not force-fit to a
+  cause that isn't there.
+- **April 2024**: smaller, scattered gaps (Apr 4-5, Apr 16-20, Apr 23) rather than one clean event -- not
+  individually investigated (diminishing returns on searching for an explanation of every few-day gap), but
+  worth remembering that gaps in this archive aren't a single one-off event, they recur at a few-gaps-per-year
+  rate.
+
+**Operational issues hit during this pull, distinct from the data-content findings above:**
+
+- The stall-detecting wrapper script (`download_smap_cap_year.sh`'s design, reused for year 2) has a real bug:
+  its own polling loop can take far longer than its configured `STALL_SECS` to actually detect a stall (one
+  case took ~30 minutes against a configured 180s threshold) -- the detection logic is correct in principle
+  but something makes it far slower in practice than intended. Root cause not fully diagnosed; worked around
+  by abandoning the wrapper for a manually-supervised one-chunk-at-a-time approach (start a chunk, wait on it
+  directly, check its own completion marker, move to the next) for the remainder of the pull.
+- **`podaac-data-downloader`'s skip-already-downloaded behavior is not reliable for a very wide date range in
+  a single invocation.** Re-running the full 2022-06-01 to 2024-06-01 range to backfill 11 known-corrupt files
+  started re-downloading files that already existed and were valid (confirmed: fresh timestamps on files
+  whose content hadn't changed, for dates far from the 11 actually-missing ones) instead of skipping them --
+  the same skip logic that worked correctly for the smaller 1-year backfill in 22. Worked around by using
+  narrow, per-incident date ranges (a day or two around each known-missing file) instead of one wide range --
+  even there, skip-detection was imperfect (a 2-day window re-fetched 58 files to recover 3 actually-missing
+  ones), but the blast radius stayed small. Lesson: never re-run this tool over a wide range expecting it to
+  cheaply no-op on existing files -- scope any backfill request as tightly as possible to the specific
+  missing dates.
+- One additional silent corruption (1 file) was introduced by killing the runaway wide-range backfill
+  mid-transfer -- caught by the same full-archive validation pass used throughout this project, then fixed
+  with one more narrow-range re-fetch. Final state: 18,353 files, 0 bad, confirmed by validating every file.
