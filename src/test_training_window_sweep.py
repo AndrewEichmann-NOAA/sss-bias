@@ -35,9 +35,13 @@ MATCHUPS_PATH = '/Users/afeman/Desktop/work/sss-bias/data/matchups/smap_cap_argo
 TEST_SPAN_MONTHS = 2
 # Origins chosen so every window length (including "all available history")
 # has enough trailing data, and the 2-month test period after each stays
-# inside the currently-downloaded archive (ends 2024-06-01).
-ORIGINS = ['2023-09-01', '2023-12-01', '2024-03-01']
-WINDOW_MONTHS = [3, 6, 12, None]  # None = all available history before the origin
+# inside the currently-downloaded archive (now extends to 2025-04-30, see
+# DESIGN.md 26.1/26.4). The two new origins push "all-history" out to 27 and
+# 32 months respectively -- addressing the original 3-origin sweep's caveat
+# that it couldn't test windows beyond ~21 months or reach past the 2023
+# El Nino peak into 2024's return toward La Nina.
+ORIGINS = ['2023-09-01', '2023-12-01', '2024-03-01', '2024-09-01', '2025-02-01']
+WINDOW_MONTHS = [3, 6, 12, 24, None]  # None = all available history before the origin
 
 
 def fit_eval(train, test, seed=0):

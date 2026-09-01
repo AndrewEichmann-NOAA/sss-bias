@@ -1312,3 +1312,43 @@ test, and the Argo-matched subsample rather than the full raw archive) -- a subt
 recalibration could still be masked by this level of aggregation. But at this resolution, over 2 years,
 there's no evidence of the instrument-level drift that would argue against 26.2's "use all available
 history" conclusion.
+
+## 26.4 Archive extended to 2025-04-30 (35 months); 26.2's conclusion needs revising -- not universal
+
+Extended the raw archive from 2 years to 2022-06-01 through 2025-04-30 (35 months). Two more corruption
+rounds along the way (38 files this time, mostly clustered June 9-16 2024, scattered elsewhere in
+2024-2025), same delete-and-narrow-range-backfill fix as 22/25. One new operational lesson: re-running
+`podaac-data-downloader` over the *full* 2022-06-01 to 2024-06-01 range to backfill 11 known-missing files
+started **re-downloading files that already existed and were valid** -- confirms 25.1's warning that skip-
+detection is unreliable over wide ranges wasn't a one-off; scoped backfills to narrow per-incident date
+ranges instead, as that section recommends. Rebuilt the matchup table (54,580 matches, up from 31,601) in
+13 minutes -- consistent with the linear-time fix from 25.1 (roughly 1.46x the data took roughly 1.7x the
+time of the 2-year build).
+
+**Re-ran `test_training_window_sweep.py` with 2 more origins (2024-09-01, 2025-02-01) and a 24-month window
+option**, addressing 26.2's caveat that only 3 origins (all within a few months of each other) was too thin
+a basis for "use all available history." Result: **4 of 5 origins still show monotonic or near-monotonic
+improvement with more history, but the newest origin does not**:
+
+| window | 2023-09-01 | 2023-12-01 | 2024-03-01 | 2024-09-01 | 2025-02-01 |
+|---|---|---|---|---|---|
+| 3mo | 1.603 | 1.760 | 2.284 | 1.174 | 1.455 |
+| 6mo | 1.442 | 1.095 | 1.312 | 1.154 | **1.161** |
+| 12mo | 1.407 | 1.054 | 1.183 | 1.057 | 1.228 |
+| 24mo | 1.383 | 1.037 | 1.186 | 1.056 | 1.206 |
+| all-history | 1.408 | 1.056 | 1.172 | **1.048** | 1.216 |
+
+At the 2025-02-01 origin (test = Feb-Mar 2025), the 6-month window (RMSE 1.161) beats both the 12-month
+(1.228) and all-history (1.216) windows -- the first non-monotonic result in the whole sweep, and exactly
+the kind of signal the sweep was designed to catch. **26.2's "no evidence yet that a rolling window beats
+using all available history" conclusion needs to be revised to: mostly true, but not universal** -- one
+origin out of five (the most recent one, nearest the edge of the currently-downloaded archive) shows a
+medium window winning outright.
+
+Not yet resolved: whether this is a genuine recency effect specific to conditions actually changing near
+the end of the archive (worth checking against the recalibration-timeseries plot from 26.3 and against
+ENSO state for that period), or an idiosyncrasy of this one origin/test window -- one anomalous origin out
+of five is not enough to conclude either way. More origins, especially as the archive extends further past
+April 2025 (26.1's overnight pull is still in progress toward 2026), would help settle whether this is a
+recurring pattern near "the present" specifically (which would matter a great deal for the operational
+choice) or a one-off.
