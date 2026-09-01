@@ -29,6 +29,7 @@ RAW_DIR = '/Users/afeman/Desktop/work/sss-bias/data/raw_smap_cap'
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--file', default=None, help='Plot one specific raw .h5 swath file instead of a date range.')
     parser.add_argument('--start-date', default='2024-01-01', help='YYYY-MM-DD')
     parser.add_argument('--days', type=int, default=7)
     parser.add_argument('--bin-deg', type=float, default=BIN_DEG)
@@ -40,16 +41,26 @@ def main():
                               'shows the actual swath/orbit-track structure, at the cost of a much '
                               'heavier plot and overlapping points where orbits cross.')
     parser.add_argument('--point-size', type=float, default=0.2, help='Marker size for --scatter.')
+    parser.add_argument('--zoom', action='store_true',
+                         help='Set axis limits to the data\'s own bounding box (with a small pad) '
+                              'instead of the fixed -180/180/-90/90 globe -- much more detail for a '
+                              'single swath or short window that only covers a small area.')
     parser.add_argument('--out', default=None)
     args = parser.parse_args()
 
-    start = datetime.strptime(args.start_date, '%Y-%m-%d')
-    end = start + timedelta(days=args.days)
-    start_str, end_str = start.strftime('%Y%m%d'), end.strftime('%Y%m%d')
+    if args.file:
+        files = [args.file]
+        label = args.file.split('/')[-1]
+        print(f"1 raw file: {label}")
+    else:
+        start = datetime.strptime(args.start_date, '%Y-%m-%d')
+        end = start + timedelta(days=args.days)
+        start_str, end_str = start.strftime('%Y%m%d'), end.strftime('%Y%m%d')
 
-    all_files = sorted(glob.glob(f'{RAW_DIR}/*.h5'))
-    files = [f for f in all_files if start_str <= re.search(r'_(\d{8})T', f).group(1) < end_str]
-    print(f"{len(files)} raw files in [{args.start_date}, +{args.days}d)")
+        all_files = sorted(glob.glob(f'{RAW_DIR}/*.h5'))
+        files = [f for f in all_files if start_str <= re.search(r'_(\d{8})T', f).group(1) < end_str]
+        label = f'{args.start_date}_{args.days}d'
+        print(f"{len(files)} raw files in [{args.start_date}, +{args.days}d)")
 
     dfs = []
     for f in files:
@@ -68,9 +79,18 @@ def main():
     full = pd.concat(dfs, ignore_index=True)
     print(f"{len(full)} QC-pass ocean obs")
 
+    title_range = label if args.file else f'{args.start_date} to {end.strftime("%Y-%m-%d")}'
+
+    if args.zoom:
+        lon_pad = max(0.5, (full['lon'].max() - full['lon'].min()) * 0.05)
+        lat_pad = max(0.5, (full['lat'].max() - full['lat'].min()) * 0.05)
+        xlim = (full['lon'].min() - lon_pad, full['lon'].max() + lon_pad)
+        ylim = (full['lat'].min() - lat_pad, full['lat'].max() + lat_pad)
+    else:
+        xlim, ylim = (-180, 180), (-90, 90)
+
     if args.scatter:
-        out_path = args.out or (f'/Users/afeman/Desktop/work/sss-bias/data/matchups/'
-                                 f'raw_smap_sss_{args.start_date}_{args.days}d_scatter.png')
+        out_path = args.out or f'/Users/afeman/Desktop/work/sss-bias/data/matchups/raw_smap_sss_{label}_scatter.png'
         vmin, vmax = np.nanpercentile(full['sss'], [2, 98])
 
         fig, ax = plt.subplots(figsize=(14, 6))
@@ -78,13 +98,12 @@ def main():
         # of points -- otherwise each point stays a separate vector object.
         sc = ax.scatter(full['lon'], full['lat'], c=full['sss'], s=args.point_size,
                          cmap='viridis', vmin=vmin, vmax=vmax, linewidths=0, rasterized=True)
-        ax.set_xlim(-180, 180)
-        ax.set_ylim(-90, 90)
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
         ax.set_xlabel('Longitude')
         ax.set_ylabel('Latitude')
         fig.colorbar(sc, ax=ax, label='PSU', fraction=0.025, pad=0.02)
-        ax.set_title(f'Raw SMAP CAP salinity, {args.start_date} to {end.strftime("%Y-%m-%d")} '
-                     f'(every QC-pass pixel, no gridding, n={len(full):,})')
+        ax.set_title(f'Raw SMAP CAP salinity, {title_range} (every QC-pass pixel, no gridding, n={len(full):,})')
         fig.tight_layout()
         fig.savefig(out_path, dpi=150)
         print(f"Saved {out_path}")
@@ -108,18 +127,17 @@ def main():
     print(f"{n_cells_filled}/{mean_grid.size} cells have >= {args.min_count} obs "
           f"({100 * n_cells_filled / mean_grid.size:.1f}%)")
 
-    out_path = args.out or (f'/Users/afeman/Desktop/work/sss-bias/data/matchups/'
-                             f'raw_smap_sss_{args.start_date}_{args.days}d.png')
+    out_path = args.out or f'/Users/afeman/Desktop/work/sss-bias/data/matchups/raw_smap_sss_{label}.png'
 
     fig, ax = plt.subplots(figsize=(14, 6))
     vmin, vmax = np.nanpercentile(mean_grid, [2, 98])
     mesh = ax.pcolormesh(lon_edges, lat_edges, mean_grid, cmap='viridis', vmin=vmin, vmax=vmax, shading='flat')
-    ax.set_xlim(-180, 180)
-    ax.set_ylim(-90, 90)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
     ax.set_xlabel('Longitude')
     ax.set_ylabel('Latitude')
     fig.colorbar(mesh, ax=ax, label='PSU', fraction=0.025, pad=0.02)
-    ax.set_title(f'Raw SMAP CAP salinity, {args.start_date} to {end.strftime("%Y-%m-%d")} '
+    ax.set_title(f'Raw SMAP CAP salinity, {title_range} '
                  f'({args.bin_deg:g}deg bins, min {args.min_count} obs/cell, n={len(full):,})')
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
