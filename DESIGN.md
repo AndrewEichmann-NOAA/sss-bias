@@ -1441,3 +1441,52 @@ comparison), either gridded/averaged or as a full-resolution rasterized scatter 
 scatter view (2.55M points, one week) shows real mesoscale structure (filaments, eddies) and coastal RFI/
 land-contamination artifacts near Japan/Southeast Asia and off South America that 5deg gridding smooths away
 entirely.
+
+## 29. Implemented and ran the Schanze et al. box-average validation -- found and fixed a real bug along the way
+
+Implemented `box_average_match_to_argo` (28's proposed fix): for each Argo report, average every raw
+satellite sample within 50km/+/-3.5 days rather than picking the single nearest one, matching the paper's
+literal Appendix B.1 recipe. Reuses `match_to_argo`'s per-file time-window pruning, swapping the
+single-nearest-neighbor `tree.query` for a `tree.query_radius` and accumulating a running sum/count per Argo
+obs instead of tracking one best match. Wired in as `--box-average` on `build_raw_smap_matchups.py`.
+
+**First run** (12-week window, full 34275-file archive as candidates): 3,567 matches, RMSD 1.52 PSU, only
+~11.2 samples averaged per matchup on average -- surprisingly low given SMAP's near-daily global revisit and
+a 7-day-wide window. Investigated directly: manually verified a specific "unmatched" Argo profile actually
+*does* have a valid QC-pass sample 1.73km away within the window (confirmed via three separate raw files).
+Traced this through several rounds of debugging (two of which turned out to be bugs in the *verification*
+script itself -- a `round(x,4) == unrounded_x` comparison that can never be true, and initially suspecting a
+timezone/dtype mismatch that wasn't the actual cause) before isolating the real cause: `load_raw_smap_dir`
+loads every file in the archive unconditionally regardless of the requested Argo date range (already flagged
+as a performance problem in 26.4/28's introduction), and at the archive's current size (35k+ files spanning
+years), processing that many files was silently causing many true matches to be missed -- confirmed by
+re-running with only the ~89 files actually relevant to one specific profile, which correctly found it, while
+the same profile was absent from the full-34275-file production output.
+
+**Fix**: added `start_date`/`end_date`/`max_time_delta` parameters to `load_raw_smap_dir` so it only loads
+files whose filename-embedded date falls within the requested Argo window (padded by `max_time_delta` on each
+side) -- the same fix already applied to `plot_raw_smap_snapshot.py`'s file globbing. This is a real
+correctness fix, not just a performance one: full-archive loading was silently dropping the large majority of
+true matches, not just running slowly.
+
+**Re-run with the fix** (same 12-week window, now loading only 1,882 relevant files instead of 35,511):
+**18,213 matches** (5.1x more than the buggy run), **77% of all Argo profiles matched** (vs. 15% before) --
+now consistent with SMAP's actual near-daily coverage -- and **67 samples averaged per matchup on average**
+(vs. 11.2 before). Total runtime: 53 seconds (vs. ~11 minutes), confirming the fix helps both correctness and
+performance simultaneously.
+
+**The RMSD result holds up under the fix**: Bias +0.36 PSU, Std 1.55, **RMSD 1.59 PSU** -- essentially
+unchanged from the buggy run's 1.52 (if anything slightly higher), despite 5x more matches and 6x more
+samples per box. This rules out "the 12-week sample was just too small" as an explanation for the gap with
+Schanze et al.'s reported SMAP RSS box-averaged RMSD (~0.25 PSU, their Fig. 4) -- the gap is robust to a much
+larger, bug-fixed sample. The most likely remaining explanation, per 28's discussion: their SMAP validation
+used the RSS product, whose L2 field is itself a Backus-Gilbert-interpolated 9-point spatial average before
+the user ever touches it (their own paper's Section 1.3), while JPL CAP's `smap_sss` (used throughout this
+project) is a raw, unsmoothed per-pixel swath retrieval -- comparing "box-average of already-smoothed RSS
+pixels" to "box-average of raw CAP pixels" isn't apples-to-apples, and CAP likely has a genuinely higher
+per-sample noise floor to begin with.
+
+Not yet done: running this on the full multi-year archive (not just 12 weeks) for a fully representative
+number, and a geographic breakdown to check whether the RMSD gap is uniform or concentrated in specific
+regions (the coarse 12-week geographic map in this section's initial pass didn't show an obvious pattern, but
+had only 10.8% cell coverage at 5deg -- worth revisiting now that the match count is 5x larger).

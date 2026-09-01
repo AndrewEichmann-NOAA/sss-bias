@@ -121,8 +121,9 @@ def load_raw_smap_file(path):
     return df.dropna(subset=['lat', 'lon', 'sss'])
 
 
-def load_raw_smap_dir(raw_dir, min_salinity, max_salinity, verbose=True):
-    """Load and QC-filter every raw SMAP CAP file in raw_dir, keeping files
+def load_raw_smap_dir(raw_dir, min_salinity, max_salinity, verbose=True,
+                       start_date=None, end_date=None, max_time_delta=None):
+    """Load and QC-filter raw SMAP CAP files in raw_dir, keeping files
     SEPARATE (one DataFrame per orbit revolution) rather than pooling into a
     single DataFrame/tree.
 
@@ -137,10 +138,31 @@ def load_raw_smap_dir(raw_dir, min_salinity, max_salinity, verbose=True):
     quality_flag == 0 mirrors build_matchups.py's SENSOR_CONFIG['smap'] QC-pass
     convention -- quality_flag *is* the IODA-converted PreQC field, verbatim
     (DESIGN.md 20).
+
+    If start_date/end_date/max_time_delta are given, only loads files whose
+    filename-embedded date falls within [start_date - max_time_delta,
+    end_date + max_time_delta] -- the archive has grown to tens of thousands
+    of files spanning years, and loading every one of them regardless of the
+    requested Argo window wastes memory/time in proportion to total archive
+    size rather than the actual date range needed (DESIGN.md 29). Padding by
+    max_time_delta keeps every file that could possibly fall in some Argo
+    obs's match window; the per-file time-window pruning in match_to_argo /
+    box_average_match_to_argo still applies on top of this coarser filter.
     """
     files = sorted(glob.glob(str(Path(raw_dir) / '*.h5')))
-    if verbose:
-        print(f"Found {len(files)} raw SMAP CAP files")
+
+    if start_date is not None and end_date is not None and max_time_delta is not None:
+        pad = pd.Timedelta(max_time_delta)
+        window_start = (start_date - pad).strftime('%Y%m%d')
+        window_end = (end_date + pad).strftime('%Y%m%d')
+        n_total = len(files)
+        files = [f for f in files
+                 if (m := re.search(r'_(\d{8})T', f)) and window_start <= m.group(1) <= window_end]
+        if verbose:
+            print(f"Filtered {n_total} total archive files down to {len(files)} "
+                  f"within [{window_start}, {window_end}]")
+    elif verbose:
+        print(f"Found {len(files)} raw SMAP CAP files (no date filter -- loading entire archive)")
 
     file_dfs = []
     n_ocean = 0
@@ -280,6 +302,78 @@ def match_to_argo(argo_df, file_dfs, max_dist_km, max_time_delta, max_abs_diff):
     return result
 
 
+def box_average_match_to_argo(argo_df, file_dfs, max_dist_km, max_time_delta):
+    """Schanze, Le Vine, Dinnat & Kao (2020) recommended validation matchup
+    (DESIGN.md 28): for each Argo report, average EVERY raw satellite sample
+    within a max_dist_km circle and +/-max_time_delta window centered on the
+    report, then compare that average to the Argo salinity -- rather than
+    match_to_argo's single nearest-neighbor pick. Their own ablation (Fig.
+    4/5) is the reason for this: a single nearest sample carries a lot of
+    retrieval noise that averaging over the box cancels out, dropping RMSD
+    from ~0.5 to ~0.25 g/kg in their Aquarius analysis.
+
+    This is a VALIDATION metric, not a training-data construction method --
+    the box is centered on the Argo report, so roughly half the averaged
+    samples postdate it, which isn't available at correction time in a
+    real-time system (see DESIGN.md 28's discussion of why this isn't sound
+    to train the deployed per-observation correction model on).
+
+    Reuses match_to_argo's per-file time-window pruning (sort Argo obs by
+    datetime once, binary-search each file's relevant window) to stay linear
+    in the requested date span, but replaces the single-nearest-neighbor
+    query with a radius query, accumulating a running sum/count per Argo obs
+    across all files instead of tracking one best match.
+    """
+    argo_df = argo_df.reset_index(drop=True)
+    argo_rad = np.radians(argo_df[['lat', 'lon']].to_numpy())
+    argo_datetime = argo_df['datetime'].to_numpy()
+    n = len(argo_df)
+
+    sum_sss = np.zeros(n)
+    count = np.zeros(n, dtype=np.int64)
+
+    order = np.argsort(argo_datetime)
+    sorted_datetime = argo_datetime[order]
+    radius_rad = max_dist_km / EARTH_RADIUS_KM
+
+    for df in file_dfs:
+        file_datetime = df['datetime'].to_numpy()
+        window_start = np.datetime64(file_datetime.min() - max_time_delta)
+        window_end = np.datetime64(file_datetime.max() + max_time_delta)
+
+        lo = np.searchsorted(sorted_datetime, window_start, side='left')
+        hi = np.searchsorted(sorted_datetime, window_end, side='right')
+        if lo >= hi:
+            continue
+        positions = order[lo:hi]
+
+        tree = BallTree(np.radians(df[['lat', 'lon']].to_numpy()), metric='haversine')
+        neighbor_lists = tree.query_radius(argo_rad[positions], r=radius_rad)
+
+        file_sss = df['sss'].to_numpy()
+        for local_i, neighbors in enumerate(neighbor_lists):
+            if len(neighbors) == 0:
+                continue
+            pos = positions[local_i]
+            valid = np.abs(argo_datetime[pos] - file_datetime[neighbors]) <= max_time_delta
+            if not valid.any():
+                continue
+            valid_neighbors = neighbors[valid]
+            sum_sss[pos] += file_sss[valid_neighbors].sum()
+            count[pos] += len(valid_neighbors)
+
+    matched_positions = np.nonzero(count > 0)[0]
+
+    result = argo_df.iloc[matched_positions].rename(columns={
+        'lat': 'argo_lat', 'lon': 'argo_lon', 'datetime': 'argo_datetime',
+        'oceanBasin': 'argo_oceanBasin', 'salinity': 'argo_salinity', 'depth': 'argo_depth',
+    }).reset_index(drop=True)
+    result['sat_sss_mean'] = sum_sss[matched_positions] / count[matched_positions]
+    result['n_samples'] = count[matched_positions]
+
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build raw JPL CAP SMAP-vs-Argo rich-feature matchup table")
     parser.add_argument('--raw-smap-dir', default='/Users/afeman/Desktop/work/sss-bias/data/raw_smap_cap')
@@ -292,7 +386,13 @@ def main():
     parser.add_argument('--min-salinity', type=float, default=20.0, help='Valid-range QC lower bound (PSU)')
     parser.add_argument('--max-salinity', type=float, default=42.0, help='Valid-range QC upper bound (PSU)')
     parser.add_argument('--max-abs-diff', type=float, default=10.0,
-                         help='Reject matched pairs with |satellite - Argo| beyond this (PSU); gross-error check')
+                         help='Reject matched pairs with |satellite - Argo| beyond this (PSU); gross-error check '
+                              '(only used in the default nearest-neighbor mode, not --box-average).')
+    parser.add_argument('--box-average', action='store_true',
+                         help='Use the Schanze et al. (2020) validation matchup instead of nearest-neighbor: '
+                              'average every satellite sample within the space-time box per Argo report, rather '
+                              'than picking the single nearest one. A validation metric, not training data -- '
+                              'see box_average_match_to_argo\'s docstring and DESIGN.md 28.')
     parser.add_argument('--out', default='/Users/afeman/Desktop/work/sss-bias/data/matchups/smap_cap_argo_matchups.parquet')
     args = parser.parse_args()
 
@@ -300,7 +400,9 @@ def main():
     end_date = datetime.strptime(args.end_date, '%Y-%m-%d')
 
     print("Loading raw SMAP CAP swath data...")
-    file_dfs = load_raw_smap_dir(args.raw_smap_dir, args.min_salinity, args.max_salinity)
+    file_dfs = load_raw_smap_dir(args.raw_smap_dir, args.min_salinity, args.max_salinity,
+                                  start_date=start_date, end_date=end_date,
+                                  max_time_delta=pd.Timedelta(hours=args.max_time_delta_hours))
     print(f"  {len(file_dfs)} orbit files with at least one QC-pass, in-range obs\n")
 
     print("Loading Argo near-surface obs...")
@@ -309,8 +411,12 @@ def main():
     print(f"  {len(argo_df)} unique near-surface profiles\n")
 
     print("Matching...")
-    result = match_to_argo(argo_df, file_dfs, args.max_dist_km,
-                            pd.Timedelta(hours=args.max_time_delta_hours), args.max_abs_diff)
+    if args.box_average:
+        result = box_average_match_to_argo(argo_df, file_dfs, args.max_dist_km,
+                                            pd.Timedelta(hours=args.max_time_delta_hours))
+    else:
+        result = match_to_argo(argo_df, file_dfs, args.max_dist_km,
+                                pd.Timedelta(hours=args.max_time_delta_hours), args.max_abs_diff)
     print(f"  {len(result)} matches")
 
     if result.empty:
@@ -322,10 +428,19 @@ def main():
     result.to_parquet(out_path, index=False)
     print(f"\nWrote {len(result)} matchups to {out_path}")
 
-    print("\nDistance (km) summary:")
-    print(result['dist_km'].describe())
-    print("\nTime delta summary:")
-    print(result['time_delta'].describe())
+    if args.box_average:
+        diff = result['sat_sss_mean'] - result['argo_salinity']
+        print("\nSalinity difference (satellite box-average - Argo) summary:")
+        print(diff.describe())
+        print(f"Bias: {diff.mean():.4f} PSU   Std: {diff.std():.4f} PSU   "
+              f"RMSD: {np.sqrt((diff ** 2).mean()):.4f} PSU")
+        print("\nSamples averaged per matchup:")
+        print(result['n_samples'].describe())
+    else:
+        print("\nDistance (km) summary:")
+        print(result['dist_km'].describe())
+        print("\nTime delta summary:")
+        print(result['time_delta'].describe())
 
 
 if __name__ == '__main__':
