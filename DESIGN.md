@@ -1489,4 +1489,20 @@ per-sample noise floor to begin with.
 Not yet done: running this on the full multi-year archive (not just 12 weeks) for a fully representative
 number, and a geographic breakdown to check whether the RMSD gap is uniform or concentrated in specific
 regions (the coarse 12-week geographic map in this section's initial pass didn't show an obvious pattern, but
-had only 10.8% cell coverage at 5deg -- worth revisiting now that the match count is 5x larger).
+had only 10.8% cell coverage at 5deg -- worth revisiting now that the match count is 5x larger; re-run at
+37.2% coverage shows one contiguous (not isolated-spike) high-RMSD streak along the equator near 80-100E,
+plausibly the Bay of Bengal/equatorial Indian Ocean freshening plumes documented in Tang et al. (20) --
+genuine fast-moving salinity fronts are exactly what a 3.5-day averaging window would smear rather than
+denoise).
+
+**Checked whether this bug affects any previously-built matchup table: it does not.** Re-ran the original
+foundational 12-week/+/-3h nearest-neighbor test (`match_to_argo`, the one validated against the IODA pipeline
+very early in this project) with the same date-filtering fix applied, and got exactly 3,550 matches with
+byte-identical distance/time-delta summary statistics to the pre-fix result. Every matchup table this project
+has trained models on -- all four match-window tables (3h/12h/24h/84h), the 2-year and 35-month builds, the
+ascending-feature rebuild -- used `match_to_argo`, not `box_average_match_to_argo`, so none of them were
+affected. The likely reason the bug is specific to the new function: `match_to_argo` uses `tree.query(k=1)`,
+a single fully-vectorized call per file with no per-point Python loop, while `box_average_match_to_argo` uses
+`tree.query_radius()`, which returns a ragged/variable-length array that must be processed with a per-point
+Python loop repeated across tens of thousands of files -- something about that combination at the archive's
+current scale silently dropped matches in a way the simpler vectorized path didn't.
