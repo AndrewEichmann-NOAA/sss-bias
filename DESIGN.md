@@ -1393,3 +1393,51 @@ mostly doesn't change the coarse picture. At 2deg bins the gap widens a bit (12h
 coverage) and finer structure becomes visible (streaky patterns suggestive of western boundary currents),
 though 1deg bins (tried on 12h only so far, 18.7% coverage) get sparse enough that isolated extreme cells
 should be treated with more suspicion than the coherent streaky features.
+
+## 28. A fourth window (+/-3.5 days) and the Schanze et al. (2020) matchup-definition paper
+
+Built a fourth matchup table at +/-84h (3.5 days), same 50km/2022-06-01 to 2025-05-01 span: 269,188 matches
+(vs. 243,041 at 24h -- only ~11% more for 3.5x the window, diminishing returns setting in). Mean match
+distance keeps dropping with wider windows (13.4km at 3h -> 7.3km at 84h), same reason as before: more
+candidate passes per Argo obs gives the nearest-neighbor search more options to find a spatially closer one.
+
+Trained the baseline/rich FFANN pair on all four windows now:
+
+| window | n_test | raw RMSE | baseline-FFANN | rich-FFANN | rich improvement |
+|---|---|---|---|---|---|
+| 3h | 28,094 | 1.477 | 1.243 | 1.127 | 9.3% |
+| 12h | 87,160 | 1.475 | 1.284 | 1.115 | 13.2% |
+| 24h | 121,925 | 1.507 | 1.315 | 1.123 | 14.6% |
+| 84h | 138,156 | 1.543 | 1.339 | **1.159** | 13.4% |
+
+At 84h, for the first time, *both* models degrade relative to the previous window (27's pattern was
+baseline-only degradation, rich staying flat). This lines up with a specific finding in Schanze, Le Vine,
+Dinnat & Kao (2020, "Comparing Satellite Salinity Retrievals with In Situ Measurements: A Recommendation for
+Aquarius and SMAP," the paper the 12h/24h/84h windows were prompted by -- their SSDT analysis, Fig. 5, shows
+RMSD getting *worse* as the window widens for nearest-single-sample-in-time matching, because the temporally
+closest match in a wide window is no longer guaranteed to be spatially close. Our matching (all four windows)
+is still nearest-neighbor, not their recommended box-average -- so 27/28's results are likely the same
+effect: widening the window without averaging just admits noisier matches past some point, rather than
+usefully expanding the sample.
+
+**The paper's actual recommendation is different from what 26-28 built**: average *every* satellite sample
+within the 50km/+/-3.5day box per Argo report (their Appendix B.1), not take the single nearest one at a
+wider window. Asked directly whether this validation-designed method is sound to use for *training* the
+deployed per-observation correction model: no, for two reasons -- (1) the box is centered on the in situ
+report, so roughly half the averaged samples come from after it, which doesn't exist yet at the moment a
+real-time DA correction needs to run on a single incoming observation; (2) even ignoring the future-data
+issue, training on an averaged (lower-noise) input while deploying on raw single-pixel retrievals is a
+train/deploy distribution mismatch -- the same class of concern as the float-ID leakage work in 17/18, just
+at the input-noise level rather than the sample-identity level. It remains legitimate as a validation/
+diagnostic tool (its designed purpose: a cleaner estimate of true systematic bias, by construction lower-
+noise than any single-window matchup table) and a causal (backward-only) version of the averaging could be
+made real-time-deployable in principle, though the input-distribution-mismatch concern would still need a
+separate answer. Not yet implemented -- box-averaging would require reworking `match_to_argo`'s per-file
+accumulation from "track single best match" (`best_dist`/`best_file_idx`/`best_local_idx`) to a running
+sum+count per Argo obs across all files, reusing the existing time-window pruning infrastructure.
+
+Also added `plot_raw_smap_snapshot.py`: a geographic snapshot of the raw retrieved SSS field itself (no Argo
+comparison), either gridded/averaged or as a full-resolution rasterized scatter of every QC-pass pixel. The
+scatter view (2.55M points, one week) shows real mesoscale structure (filaments, eddies) and coastal RFI/
+land-contamination artifacts near Japan/Southeast Asia and off South America that 5deg gridding smooths away
+entirely.

@@ -147,7 +147,7 @@ def main():
                          help='chronological (default): train on earlier months, test on later ones, '
                               'to check the rich-feature gain survives a season change (DESIGN.md 24). '
                               'random: 70/15/15 random split (only meaningful for a single-season table).')
-    parser.add_argument('--window', choices=['3h', '12h', '24h'], default='3h',
+    parser.add_argument('--window', choices=['3h', '12h', '24h', '84h'], default='3h',
                          help='Which match-window matchup table to train on (see '
                               'build_raw_smap_matchups.py --max-time-delta-hours and DESIGN.md\'s '
                               'Vernieres et al. match-window discussion). 3h is the default table '
