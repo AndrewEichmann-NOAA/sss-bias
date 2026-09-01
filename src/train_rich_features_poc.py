@@ -42,6 +42,7 @@ RICH_EXTRA_FEATURES = [
     'sat_tb_h_bias_adj', 'sat_tb_v_bias_adj',
     'sat_nedt_h_fore', 'sat_nedt_h_aft', 'sat_nedt_v_fore', 'sat_nedt_v_aft',
     'sat_smap_spd', 'sat_smap_high_spd', 'sat_smap_high_dir', 'sat_smap_high_dir_smooth',
+    'sat_ascending',  # not a netCDF field -- parsed from the raw filename, see build_raw_smap_matchups.py
 ]
 RICH_FEATURES = BASELINE_FEATURES + RICH_EXTRA_FEATURES
 
@@ -146,9 +147,17 @@ def main():
                          help='chronological (default): train on earlier months, test on later ones, '
                               'to check the rich-feature gain survives a season change (DESIGN.md 24). '
                               'random: 70/15/15 random split (only meaningful for a single-season table).')
+    parser.add_argument('--window', choices=['3h', '12h', '24h'], default='3h',
+                         help='Which match-window matchup table to train on (see '
+                              'build_raw_smap_matchups.py --max-time-delta-hours and DESIGN.md\'s '
+                              'Vernieres et al. match-window discussion). 3h is the default table '
+                              '(smap_cap_argo_matchups.parquet); 12h/24h use the wider-window tables.')
     args = parser.parse_args()
 
-    df = pd.read_parquet(MATCHUPS_PATH)
+    matchups_path = MATCHUPS_PATH if args.window == '3h' else \
+        f'/Users/afeman/Desktop/work/sss-bias/data/matchups/smap_cap_argo_matchups_{args.window}.parquet'
+
+    df = pd.read_parquet(matchups_path)
     df = add_features(df)
     print(f"Loaded {len(df)} matchups, {df['sat_datetime'].min()} to {df['sat_datetime'].max()}")
 
@@ -193,7 +202,7 @@ def main():
     results['ffann_rich_features'], pred_rich = fit_and_eval_ffann(
         RICH_FEATURES, train, val, test, 'rich features')
 
-    print(f"\n=== Rich-feature POC test-set results (n={len(test)}, {args.split} split) ===")
+    print(f"\n=== Rich-feature POC test-set results (window={args.window}, n={len(test)}, {args.split} split) ===")
     print(f"{'method':<26}{'n':>6}{'rmse':>10}{'bias':>10}{'corr':>10}")
     for name, m in results.items():
         print(f"{name:<26}{m['n']:>6}{m['rmse']:>10.4f}{m['bias']:>10.4f}{m['corr']:>10.4f}")
@@ -209,7 +218,8 @@ def main():
         'pred_ffann_baseline': pred_baseline,
         'pred_ffann_rich': pred_rich,
     })
-    predictions_path = '/Users/afeman/Desktop/work/sss-bias/data/matchups/cap_test_predictions.parquet'
+    suffix = '' if args.window == '3h' else f'_{args.window}'
+    predictions_path = f'/Users/afeman/Desktop/work/sss-bias/data/matchups/cap_test_predictions{suffix}.parquet'
     predictions.to_parquet(predictions_path, index=False)
     print(f"\nSaved row-level test predictions to {predictions_path}")
 

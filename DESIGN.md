@@ -1352,3 +1352,44 @@ of five is not enough to conclude either way. More origins, especially as the ar
 April 2025 (26.1's overnight pull is still in progress toward 2026), would help settle whether this is a
 recurring pattern near "the present" specifically (which would matter a great deal for the operational
 choice) or a one-off.
+
+## 27. Ascending/descending added as a feature; wider match-window tables built and modeled
+
+Added `sat_ascending` (parsed from the raw filename's `_A_`/`_D_` flag, not a netCDF field -- see 21.1) to
+`RICH_EXTRA_FEATURES`. Permutation importance ranks it 29th of 40 (Delta-RMSE +0.0014, negligible) -- its
+likely signal (AM/PM diurnal SST/wind cycle) is apparently already captured more directly by the continuous
+`sat_anc_sst`/`sat_anc_spd`/`sat_smap_spd` values themselves.
+
+Built two additional matchup tables at wider time windows -- `smap_cap_argo_matchups_12h.parquet` and
+`_24h.parquet` -- motivated by the earlier Vernieres et al. (2014) discussion (his Aquarius-based correction
+used 3 degrees/24h, much looser than this project's 50km/3h, itself resolution-matched to SMAP's finer ~40km
+footprint). Same 50km spatial radius, same 2022-06-01 to 2025-05-01 span, only `--max-time-delta-hours`
+changed. Match counts: 54,787 (3h) / 173,711 (12h) / 243,041 (24h) -- a wider window recovers substantially
+more matches, and mean match distance actually *drops* slightly as the window widens (13.4km to 10.7km),
+since more candidate passes give the nearest-neighbor search more options to find a closer one.
+
+`train_rich_features_poc.py` now takes `--window {3h,12h,24h}`. Trained the same baseline/rich FFANN pair on
+all three (same chronological split convention, same feature sets):
+
+| window | n_test | raw RMSE | baseline-FFANN | rich-FFANN | rich improvement |
+|---|---|---|---|---|---|
+| 3h | 28,094 | 1.477 | 1.243 | 1.127 | 9.3% |
+| 12h | 87,160 | 1.475 | 1.284 | 1.115 | 13.2% |
+| 24h | 121,925 | 1.507 | 1.315 | **1.123** | 14.6% |
+
+Notable pattern: rich-FFANN RMSE stays essentially flat (1.115-1.127) across all three windows despite ~4.3x
+more data at 24h, but baseline-FFANN RMSE steadily *worsens* as the window widens (1.243 -> 1.284 -> 1.315).
+The relative rich-feature advantage grows from 9% at 3h to 15% at 24h. Plausible explanation: a wider time
+window pairs satellite obs with less-contemporaneous Argo profiles -- pure temporal-mismatch noise the
+baseline model (lat/lon/season/basin/sat_sss only) has no way to compensate for, whereas the rich model's
+extra fields (actual per-pass SST/wind, not a stale proxy) and/or the added training volume appear to offset
+that noise. Not yet isolated which of those two explanations (better features vs. more data) is doing the
+work -- would need a controlled test (same n_train across windows) to separate them.
+
+Also built `plot_geographic_errors_window.py` (generalized from a 12h-specific script) for raw bias/RMSE maps
+at either window and any bin size. At 5deg bins, 12h and 24h look nearly identical to the original 3h map
+(48-49% cell coverage either way) -- 5deg bins already had enough matches at 3h that widening the window
+mostly doesn't change the coarse picture. At 2deg bins the gap widens a bit (12h: 38.9%, 24h: 40.7% cell
+coverage) and finer structure becomes visible (streaky patterns suggestive of western boundary currents),
+though 1deg bins (tried on 12h only so far, 18.7% coverage) get sparse enough that isolated extreme cells
+should be treated with more suspicion than the coherent streaky features.

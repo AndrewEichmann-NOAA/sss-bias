@@ -34,6 +34,7 @@ raw values and manually replacing each variable's declared _FillValue with NaN.
 
 import argparse
 import glob
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -78,8 +79,21 @@ def _read_var(ds, name):
     return arr
 
 
+def _parse_ascending(path):
+    """Ascending/descending isn't a netCDF variable -- it's embedded in the raw
+    filename itself (`_A_`/`_D_` in SMAP_L2B_SSS_NRT_..._A_...20220608T....h5,
+    see DESIGN.md 21.1). Returns 1.0 for ascending, 0.0 for descending.
+    """
+    m = re.search(r'_([AD])_\d{8}T', Path(path).name)
+    if not m:
+        raise ValueError(f"Could not find ascending/descending flag in filename: {path}")
+    return 1.0 if m.group(1) == 'A' else 0.0
+
+
 def load_raw_smap_file(path):
     """Load one JPL CAP L2B swath file into a flat per-pixel DataFrame."""
+    ascending = _parse_ascending(path)
+
     ds = nc.Dataset(path)
     ds.set_auto_mask(False)
     try:
@@ -96,7 +110,8 @@ def load_raw_smap_file(path):
         seconds = np.round(row_time_2d).astype('int64')
         dt = base + seconds.astype('timedelta64[s]')
 
-        data = {'lat': lat.ravel(), 'lon': lon.ravel(), 'sss': sss.ravel(), 'datetime': dt.ravel()}
+        data = {'lat': lat.ravel(), 'lon': lon.ravel(), 'sss': sss.ravel(), 'datetime': dt.ravel(),
+                'ascending': np.full(lat.size, ascending)}
         for field in RICH_FIELDS:
             data[field] = _read_var(ds, field).ravel()
         df = pd.DataFrame(data)
