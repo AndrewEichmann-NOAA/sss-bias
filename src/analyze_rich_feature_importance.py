@@ -16,6 +16,8 @@ Averaged over N_REPEATS independent shufflings per feature to smooth out the shu
 own randomness -- a single shuffle can over/under-state a feature's importance by luck.
 """
 
+import argparse
+
 import numpy as np
 import pandas as pd
 import torch
@@ -30,7 +32,13 @@ SEED = 0
 
 
 def main():
-    df = pd.read_parquet(MATCHUPS_PATH)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--matchups-path', default=MATCHUPS_PATH)
+    parser.add_argument('--out', default=OUT_PATH)
+    args = parser.parse_args()
+    matchups_path, out_path = args.matchups_path, args.out
+
+    df = pd.read_parquet(matchups_path)
     df = add_features(df)
     n_before = len(df)
     df = df.dropna(subset=RICH_FEATURES).reset_index(drop=True)
@@ -81,8 +89,8 @@ def main():
     print(f"\n=== Ranked by mean RMSE increase when shuffled ({N_REPEATS} repeats) ===")
     print(imp_df.to_string(index=False))
 
-    imp_df.to_parquet(OUT_PATH, index=False)
-    print(f"\nSaved to {OUT_PATH}")
+    imp_df.to_parquet(out_path, index=False)
+    print(f"\nSaved to {out_path}")
 
 
 if __name__ == '__main__':

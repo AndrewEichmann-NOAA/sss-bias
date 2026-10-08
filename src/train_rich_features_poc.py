@@ -29,8 +29,13 @@ MATCHUPS_PATH = '/Users/afeman/Desktop/work/sss-bias/data/matchups/smap_cap_argo
 TARGET_COLUMN = 'argo_salinity'
 BASIN_CODES = [0, 1, 2, 3, 4, 5]
 
-BASELINE_FEATURES = ['sat_sss', 'sat_lat', 'lon_sin', 'lon_cos', 'doy_sin', 'doy_cos'] + \
-    [f'basin_{c}' for c in BASIN_CODES]
+# Default feature sets carry NO basin inputs (DESIGN.md 44.1): the basin flags are a
+# post-hoc lat/lon-derived analysis aid, not real model information. The *_WITH_BASIN
+# lists exist only for the basin ablation (compare_basin_ablation.py) and to read
+# checkpoints trained before this rule (rich_correction_model.pt).
+BASIN_FEATURES = [f'basin_{c}' for c in BASIN_CODES]
+BASELINE_FEATURES = ['sat_sss', 'sat_lat', 'lon_sin', 'lon_cos', 'doy_sin', 'doy_cos']
+BASELINE_FEATURES_WITH_BASIN = BASELINE_FEATURES + BASIN_FEATURES
 
 # Excludes sat_anc_swh (100% fill in this product, see DESIGN.md 23) and
 # sat_quality_flag (constant 0 -- already QC-filtered to pass-only).
@@ -45,6 +50,7 @@ RICH_EXTRA_FEATURES = [
     'sat_ascending',  # not a netCDF field -- parsed from the raw filename, see build_raw_smap_matchups.py
 ]
 RICH_FEATURES = BASELINE_FEATURES + RICH_EXTRA_FEATURES
+RICH_FEATURES_WITH_BASIN = BASELINE_FEATURES_WITH_BASIN + RICH_EXTRA_FEATURES
 
 
 class Standardizer:
@@ -75,11 +81,13 @@ def add_features(df):
     df['lon_sin'] = np.sin(lon_rad)
     df['lon_cos'] = np.cos(lon_rad)
 
-    # No sat_oceanBasin in the raw-CAP table (unlike the IODA-based pipeline's
-    # features.py) -- argo_oceanBasin is an equally valid stand-in since
-    # matches are colocated within 50km, almost always the same basin.
-    for code in BASIN_CODES:
-        df[f'basin_{code}'] = (df['argo_oceanBasin'] == code).astype(float)
+    # Basin columns are built only for the ablation / legacy *_WITH_BASIN lists; the
+    # default feature sets don't use them. No sat_oceanBasin in the raw-CAP table
+    # (unlike the IODA-based pipeline's features.py) -- argo_oceanBasin is an
+    # equally valid stand-in since matches are colocated within 50km.
+    if 'argo_oceanBasin' in df.columns:
+        for code in BASIN_CODES:
+            df[f'basin_{code}'] = (df['argo_oceanBasin'] == code).astype(float)
 
     return df
 
@@ -151,11 +159,16 @@ def main():
                          help='Which match-window matchup table to train on (see '
                               'build_raw_smap_matchups.py --max-time-delta-hours and DESIGN.md\'s '
                               'Vernieres et al. match-window discussion). 3h is the default table '
-                              '(smap_cap_argo_matchups.parquet); 12h/24h use the wider-window tables.')
+                              '(smap_cap_argo_matchups.parquet); 12h/24h use the wider-window tables. '
+                              'Ignored if --matchups-path is given.')
+    parser.add_argument('--matchups-path', default=None,
+                         help='Explicit matchup table path, overriding --window (e.g. the GDAC-QC-filtered '
+                              'table from build_raw_smap_matchups.py --gdac-qc, DESIGN.md 31).')
     args = parser.parse_args()
 
-    matchups_path = MATCHUPS_PATH if args.window == '3h' else \
-        f'/Users/afeman/Desktop/work/sss-bias/data/matchups/smap_cap_argo_matchups_{args.window}.parquet'
+    matchups_path = args.matchups_path if args.matchups_path else (
+        MATCHUPS_PATH if args.window == '3h' else
+        f'/Users/afeman/Desktop/work/sss-bias/data/matchups/smap_cap_argo_matchups_{args.window}.parquet')
 
     df = pd.read_parquet(matchups_path)
     df = add_features(df)
