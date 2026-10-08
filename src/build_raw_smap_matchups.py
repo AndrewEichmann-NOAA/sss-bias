@@ -190,6 +190,13 @@ def load_argo_for_window(base_dir, start_date, end_date, max_depth, min_salinity
     [start_date, end_date), reusing build_matchups.py's per-cycle loader and
     dedup convention (profiles are replicated across their +/-4-cycle window,
     see DESIGN.md 15.5 / build_matchups.py's own dedup step).
+
+    min_salinity here should be the Argo-specific floor (default 30.0 in
+    main(), not the satellite side's looser 20.0) -- see DESIGN.md 30:
+    a floor of 20 let stuck-sensor Argo profiles (20-27 PSU, repeating on
+    the ~10-day float cycle, in open-ocean regions with no plausible
+    freshwater source) through, inflating the box-average validation
+    table's RMSD roughly 2x.
     """
     processor = NetCDFCycleProcessor(base_dir)
     cycle_dirs = processor.find_cycle_directories(start_date, end_date)
@@ -383,8 +390,13 @@ def main():
     parser.add_argument('--max-dist-km', type=float, default=50.0)
     parser.add_argument('--max-time-delta-hours', type=float, default=3.0)
     parser.add_argument('--max-depth', type=float, default=5.0, help='Argo near-surface depth cutoff (m)')
-    parser.add_argument('--min-salinity', type=float, default=20.0, help='Valid-range QC lower bound (PSU)')
+    parser.add_argument('--min-salinity', type=float, default=20.0,
+                         help='Satellite valid-range QC lower bound (PSU)')
     parser.add_argument('--max-salinity', type=float, default=42.0, help='Valid-range QC upper bound (PSU)')
+    parser.add_argument('--argo-min-salinity', type=float, default=30.0,
+                         help='Argo valid-range QC lower bound (PSU) -- stricter than the satellite-side '
+                              'min_salinity since Argo PreQC is unusable and this is the only guard against '
+                              'stuck-sensor profiles (DESIGN.md 30)')
     parser.add_argument('--max-abs-diff', type=float, default=10.0,
                          help='Reject matched pairs with |satellite - Argo| beyond this (PSU); gross-error check '
                               '(only used in the default nearest-neighbor mode, not --box-average).')
@@ -393,6 +405,22 @@ def main():
                               'average every satellite sample within the space-time box per Argo report, rather '
                               'than picking the single nearest one. A validation metric, not training data -- '
                               'see box_average_match_to_argo\'s docstring and DESIGN.md 28.')
+    parser.add_argument('--gdac-qc', action='store_true',
+                         help='Replace the argo_min_salinity/max_salinity range heuristic with real GDAC PSAL_QC '
+                              '(DESIGN.md 31): loads Argo with no range filter, keeps only profiles with good '
+                              '(1/2) QC recovered by fetch_gdac_argo_qc.py, and uses the delayed-mode-preferred '
+                              'salinity value instead of the obsForge real-time one. Profiles with no recovered '
+                              'GDAC match are dropped (conservative -- see gdac_qc_filter.py).')
+    parser.add_argument('--gdac-qc-dir', default='/Users/afeman/Desktop/work/sss-bias/data/gdac_argo_qc',
+                         help='Directory of fetch_gdac_argo_qc.py monthly output, used only with --gdac-qc.')
+    parser.add_argument('--gdac-direct', action='store_true',
+                         help='Use Argo profiles fetched directly from the GDAC (fetch_gdac_argo_direct.py, '
+                              'DESIGN.md 34) instead of obsForge -- not gated by obsForge local archive '
+                              'completeness (found to undercount by ~50%% vs. the true GDAC index, DESIGN.md '
+                              '33/34). Overrides --gdac-qc if both given. oceanBasin is NaN (not available '
+                              'from GDAC) -- see gdac_qc_filter.load_gdac_direct_argo.')
+    parser.add_argument('--gdac-direct-dir', default='/Users/afeman/Desktop/work/sss-bias/data/gdac_argo_direct',
+                         help='Directory of fetch_gdac_argo_direct.py monthly output, used only with --gdac-direct.')
     parser.add_argument('--out', default='/Users/afeman/Desktop/work/sss-bias/data/matchups/smap_cap_argo_matchups.parquet')
     args = parser.parse_args()
 
@@ -406,8 +434,19 @@ def main():
     print(f"  {len(file_dfs)} orbit files with at least one QC-pass, in-range obs\n")
 
     print("Loading Argo near-surface obs...")
-    argo_df = load_argo_for_window(args.argo_base_dir, start_date, end_date,
-                                    args.max_depth, args.min_salinity, args.max_salinity)
+    if args.gdac_direct:
+        from gdac_qc_filter import load_gdac_direct_argo
+        argo_df = load_gdac_direct_argo(args.gdac_direct_dir, start_date, end_date)
+    elif args.gdac_qc:
+        argo_df = load_argo_for_window(args.argo_base_dir, start_date, end_date,
+                                        args.max_depth, min_salinity=0.0, max_salinity=45.0)
+        print(f"  {len(argo_df)} unique near-surface profiles (before GDAC QC filter)")
+        from gdac_qc_filter import load_qc_lookup, apply_qc_filter
+        qc_lookup = load_qc_lookup(args.gdac_qc_dir)
+        argo_df = apply_qc_filter(argo_df, qc_lookup)
+    else:
+        argo_df = load_argo_for_window(args.argo_base_dir, start_date, end_date,
+                                        args.max_depth, args.argo_min_salinity, args.max_salinity)
     print(f"  {len(argo_df)} unique near-surface profiles\n")
 
     print("Matching...")

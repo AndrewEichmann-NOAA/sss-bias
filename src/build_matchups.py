@@ -89,7 +89,14 @@ def load_argo_near_surface(cycle_path, cycle_hour, max_depth, min_salinity, max_
     ~0.118 PSU across all depths). Real Argo delayed-mode QC flags were not
     carried through the obsForge/IODA conversion, so we apply a physically
     motivated valid-range filter instead (min_salinity/max_salinity), rather
-    than trusting PreQC.
+    than trusting PreQC. build_matchups passes a stricter argo_min_salinity
+    here than the satellite side's own min_salinity (DESIGN.md 30): a floor
+    of 20 still let obviously-stuck-sensor Argo profiles (20-27 PSU,
+    repeating on the ~10-day float cycle, in open-ocean regions with no
+    plausible freshwater source) through into the box-average validation
+    table, inflating its RMSD roughly 2x. Real open-ocean bulk salinity
+    essentially never drops below ~30 PSU outside estuaries/ice melt, so 30
+    is used as the Argo-specific floor instead.
 
     NOTE: uses `originalDateTime`, not `dateTime`, as the observation
     timestamp. Argo obs are assimilated on a wider +/-4-cycle window than
@@ -239,8 +246,8 @@ def match_windowed(argo_df, candidates, max_dist_km, max_time_delta, max_abs_dif
 
 
 def build_matchups(base_dir, sensor, start_date, end_date, max_dist_km, max_time_delta_hours,
-                    max_depth=5.0, min_salinity=20.0, max_salinity=42.0, max_abs_diff=10.0,
-                    cycle_window=4, verbose=True):
+                    max_depth=5.0, min_salinity=20.0, max_salinity=42.0, argo_min_salinity=30.0,
+                    max_abs_diff=10.0, cycle_window=4, verbose=True):
     """cycle_window: how many 6h cycles on either side of an Argo obs's own cycle to
     search for a satellite match (default 4 = +/-24h, matching Argo's wider DA
     assimilation window -- see DESIGN.md 15.5). Satellite files are loaded and their
@@ -266,7 +273,7 @@ def build_matchups(base_dir, sensor, start_date, end_date, max_dist_km, max_time
         return sat_cache[idx]
 
     for i, (date, cycle, cycle_path) in enumerate(cycle_dirs):
-        argo_df = load_argo_near_surface(cycle_path, cycle, max_depth, min_salinity, max_salinity)
+        argo_df = load_argo_near_surface(cycle_path, cycle, max_depth, argo_min_salinity, max_salinity)
 
         window = range(max(0, i - cycle_window), min(len(cycle_dirs), i + cycle_window + 1))
         candidates = [get_sat(j) for j in window]
@@ -333,8 +340,13 @@ def main():
     parser.add_argument('--max-dist-km', type=float, default=50.0)
     parser.add_argument('--max-time-delta-hours', type=float, default=3.0)
     parser.add_argument('--max-depth', type=float, default=5.0, help='Argo near-surface depth cutoff (m)')
-    parser.add_argument('--min-salinity', type=float, default=20.0, help='Valid-range QC lower bound (PSU)')
+    parser.add_argument('--min-salinity', type=float, default=20.0,
+                         help='Satellite valid-range QC lower bound (PSU)')
     parser.add_argument('--max-salinity', type=float, default=42.0, help='Valid-range QC upper bound (PSU)')
+    parser.add_argument('--argo-min-salinity', type=float, default=30.0,
+                         help='Argo valid-range QC lower bound (PSU) -- stricter than the satellite-side '
+                              'min_salinity since Argo PreQC is unusable and this is the only guard against '
+                              'stuck-sensor profiles (DESIGN.md 30)')
     parser.add_argument('--max-abs-diff', type=float, default=10.0,
                          help='Reject matched pairs with |satellite - Argo| beyond this (PSU); gross-error check')
     parser.add_argument('--cycle-window', type=int, default=4,
@@ -353,6 +365,7 @@ def main():
         args.base_dir, args.sensor, start_date, end_date,
         args.max_dist_km, args.max_time_delta_hours,
         max_depth=args.max_depth, min_salinity=args.min_salinity, max_salinity=args.max_salinity,
+        argo_min_salinity=args.argo_min_salinity,
         max_abs_diff=args.max_abs_diff, cycle_window=args.cycle_window,
         verbose=not args.quiet,
     )
