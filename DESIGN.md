@@ -1506,3 +1506,1073 @@ a single fully-vectorized call per file with no per-point Python loop, while `bo
 `tree.query_radius()`, which returns a ragged/variable-length array that must be processed with a per-point
 Python loop repeated across tens of thousands of files -- something about that combination at the archive's
 current scale silently dropped matches in a way the simpler vectorized path didn't.
+
+With the fix confirmed safe, the box-average validation was re-run over the full 35-month validated archive
+(2022-06-01 to 2025-05-01), the same span used for the project's main 2-year+ training tables:
+
+```
+Filtered 35938 total archive files down to 26863 within [20220528, 20250504]
+310329 unique near-surface profiles
+Matching...
+  270368 matches
+Bias: 0.3106 PSU   Std: 1.5463 PSU   RMSD: 1.5772 PSU
+Samples averaged per matchup: mean 62.5, median 64, min 1, max 500
+```
+
+87% of all Argo profiles found a box match (270,368 / 310,329), consistent with SMAP's near-global daily
+coverage. Compared against the earlier 12-week test:
+
+| | 12-week (n=18,213) | 35-month (n=270,368) |
+|---|---|---|
+| Bias | +0.36 | +0.31 |
+| Std | 1.55 | 1.55 |
+| RMSD | 1.59 | 1.58 |
+| Mean samples/matchup | 67.3 | 62.5 |
+
+The statistics are essentially unchanged across a ~15x larger, fully independent multi-year sample -- strong
+evidence that the ~1.5-1.6 PSU RMSD is a stable, genuine property of this validation method applied to JPL CAP
+data, not a small-sample artifact. It remains far above Schanze et al.'s reported ~0.25 PSU for SMAP, which is
+consistent with their validation using the RSS product (already 9-point Backus-Gilbert pre-averaged) rather
+than JPL CAP's raw per-pixel retrievals -- box-averaging raw single-footprint noise over 50km/3.5 days doesn't
+recover the same noise reduction as averaging an already-smoothed product.
+
+### 30. Argo QC gap: stuck-sensor profiles inflating the box-average RMSD
+
+Geographic RMSD maps of the 35-month box-average table (5deg and 2deg bins, `plot_boxavg_geographic_rmsd.py`)
+show a handful of 2deg cells with RMSD >10 PSU, far above the ~0.85-1.6 PSU typical elsewhere. Per-match
+inspection of the three worst cells (20N/156W near Hawaii, 8N/62E in the Arabian Sea, 16S/10E in the South
+Atlantic) found the same signature in each: a subset of matches with `argo_salinity` in the 20-27 PSU range --
+physically implausible bulk salinity for any of these open-ocean regions (no river mouth, no ice melt) --
+paired against a completely normal, mutually-consistent satellite reading of 34.5-37 PSU across dozens of
+independent samples. The satellite side is fine; a handful of malfunctioning/stuck Argo sensors are not. The
+repeating ~10-day date spacing within a cluster (e.g. the South Atlantic cell's matches land on 6/5, 6/15,
+6/25, 7/5, 7/15...) is the signature of a single drifting float reporting a bad value on every cycle, not
+independent random failures.
+
+This isn't a new problem -- `build_matchups.py`'s `load_argo_near_surface` docstring already documented
+(section on PreQC) that Argo's own QC flag is useless here (verified uniformly 0/pass even for a stuck sensor
+reading 0.06 PSU), which is why a physically-motivated `min_salinity` valid-range filter was used instead.
+The gap was that `min_salinity` defaulted to 20.0, shared between the satellite and Argo sides of the loader --
+loose enough that these 20-27 PSU stuck-sensor profiles still passed. `match_to_argo`'s nearest-neighbor
+tables have a second line of defense (`max_abs_diff`, default 10 PSU, rejects the matched pair outright if
+|satellite - Argo| exceeds it) that `box_average_match_to_argo` never had, which is why this leaked through so
+visibly in the box-average table specifically.
+
+Quantified impact on the full 35-month box-average table: only 9,221 of 270,368 matches (3.4%) have
+`argo_salinity` < 30, but removing them alone roughly halves the whole-dataset error:
+
+| | All matches (n=270,368) | argo_salinity >= 30 (n=261,147) |
+|---|---|---|
+| Bias | +0.31 | +0.11 |
+| Std | 1.55 | 0.85 |
+| RMSD | 1.58 | 0.85 |
+
+0.85 PSU is much closer to Schanze et al.'s ~0.25 PSU than the original 1.58 -- most (not all) of the earlier
+"unaveraged JPL CAP vs. pre-averaged RSS" explanation in section 29 was actually this QC gap. The residual
+~0.85 vs. ~0.25 gap is likely where that pre-averaging explanation still applies.
+
+Fix: added a separate `--argo-min-salinity` CLI arg (default 30.0) to both `build_matchups.py` and
+`build_raw_smap_matchups.py`, decoupled from the satellite-side `--min-salinity` (still 20.0, left alone since
+real satellite obs can legitimately read fresher near major river plumes at low latitude, unlike a bulk Argo
+profile average at these mid-ocean locations). `load_argo_near_surface`/`load_argo_for_window` now receive the
+stricter Argo-specific floor. This affects every matchup table's Argo loading, not just the box-average table.
+Rebuilt the 35-month box-average table (261,357 matches, Bias +0.10, Std 0.84, RMSD 0.84 -- down from 1.58)
+and the 24h nearest-neighbor table (236,245 matches, down from 243,041) with the fix applied.
+
+### 31. Testing whether raw GDAC Argo data (real PSAL_QC) offers a real improvement over the range-filter heuristic
+
+Motivated directly by 30: our fix works by picking a numeric floor, which is inherently blunt -- it can only
+catch bad profiles by how extreme their value looks, not by whether the value is actually correct. The real
+Argo GDAC archive carries actual per-obs QC (`PSAL_QC`, delayed-mode-reviewed) that doesn't have this
+limitation. First segment-scale test of whether switching to it is worth doing, following up 14/17's
+investigation and reusing `enrich_argo_metadata.py`'s GDAC index matching and `test_sensor_aging_hypothesis.py`'s
+direct-HTTPS profile fetch (argopy's own `profile()` fetcher errors on this dataset's filename pattern).
+
+`src/test_gdac_qc_recovery.py`: loads one month (June 2022) of obsForge near-surface Argo obs with NO
+valid-range filter applied (min_salinity=0, max_salinity=45 -- obsForge's own crude bound) so the filter's
+passes and misses are both visible, matches each to the GDAC index by (lat, lon, datetime) (89.5% matched
+within 1km/10min), and fetches each matched profile's real `PSAL_QC`/`PSAL_ADJUSTED_QC` and delayed-mode
+salinity directly from the archive. (One re-run needed: the argopy index cache directory from an earlier
+session's `enrich_argo_metadata.py` run had gone stale/incompatible -- FileNotFoundError loading from cache --
+worked around by pointing to a fresh cache directory rather than debugging the old one.)
+
+**Result: real QC agrees strongly with the new 30 PSU floor, and reveals a substantially bigger problem the
+floor can't see at all.**
+
+| obsForge salinity range | n | worst near-surface PSAL_QC: good (1) | bad (3/4) |
+|---|---|---|---|
+| <20 (old filter rejected) | 267 | 47 (18%) | 172 (64%) |
+| 20-30 (this session's just-fixed gap) | 258 | 3 (1%) | 250 (97%) |
+| >=30 (passes both filters, old and new) | 8,056 | 6,165 (77%) | 1,383 (17%) |
+
+The 20-30 PSU fix is strongly validated -- 97% of what it now excludes is confirmed bad by real QC, essentially
+nothing legitimate is being thrown out. But 1,383 profiles (17%) *inside* the range both filters accept are
+still QC-bad -- over 5x the volume of the problem just fixed. These are corrupted-but-plausible values (a
+slowly drifting sensor reading 32 instead of 35, say) that no numeric floor/ceiling can ever catch, because
+there's no threshold to draw. Every matchup table in this project, even post-fix, still contains this
+population uncorrected.
+
+Side finding: of the <20 PSU profiles the range filter already rejects, 47 (18%) are actually real, QC-good
+low-salinity water (river plume/shelf/Arctic regions) -- a single global floor also discards some legitimate
+data, consistent with GDASApp's own region-specific bounds noted in 17.4 (Northwestern European shelves down
+to 0, Arctic down to 2, etc., rather than one global number).
+
+Overall |obsForge - delayed-mode-preferred| discrepancy: median ~0.0001 PSU (most profiles already agree
+closely), but heavy-tailed (std 0.23, max 12.0), consistent with the QC-bad population above driving the tail.
+DATA_MODE for this 2022 window is already mostly delayed-mode (7,702 D / 481 R / 398 A of 8,581), so most of
+these profiles' best-available QC is already final, not provisional.
+
+**Conclusion: yes, switching (at least the QC layer) to raw GDAC data is worth it, not marginal** -- it would
+catch roughly 5x more bad data than range-filtering alone, for the same already-available profiles, and would
+also stop discarding legitimate shelf/Arctic/river-plume data. Not yet implemented: this was a diagnostic
+segment test (one month, matched via lat/lon/datetime proximity, not yet wired into the matchup-building
+pipeline itself). Next step, if pursued: extend `enrich_argo_metadata.py`'s WMO/file lookup + this session's
+QC-fetch pattern to the full matchup date range, then filter matchup tables by real `PSAL_QC` instead of (or
+in addition to) the range heuristic.
+
+## 32. Scaled 31 to the full matchup range and retrained a model -- the biggest result this project has produced
+
+Followed through on 31's conclusion: scaled the GDAC QC fetch from one month to the project's full matchup
+range, wired it into the matchup-building pipeline as a real option (not just a diagnostic), and retrained.
+
+**Infrastructure**: `src/fetch_gdac_argo_qc.py` generalizes 31's one-off script into a chunked, resumable
+fetcher (same pattern as `fetch_raw_argo.py`) -- one month at a time, skipping months already fetched, so an
+interrupted run costs nothing. Fetched 2022-06-01 to 2025-05-01 (the project's main 35-month span, 264,090
+profiles, ~47 min) and then extended to 2025-11-30 (the actual end of the local obsForge Argo archive -- the
+raw SMAP archive now extends to 2026-08-29 following that overnight download, but obsForge's Argo side stops
+at 2025-11-30, so that's the true limit for now; +62,359 more profiles, ~15 min). Combined QC-good (1/2) rate:
+69.8% of 264,090 (first pass); the extension added a comparable proportion.
+
+`src/gdac_qc_filter.py` merges an Argo obs DataFrame against the fetched QC lookup by an EXACT (lat, lon,
+datetime) match -- not fuzzy nearest-neighbor -- since both sides come from the identical deterministic NetCDF
+parse of the same source files, so coordinates are bit-identical whichever call site loaded them. Keeps only
+QC 1/2 profiles and replaces the obsForge value with the delayed-mode-preferred one. Wired into
+`build_raw_smap_matchups.py` as `--gdac-qc` (works for both nearest-neighbor and `--box-average` modes, since
+it only changes how `argo_df` is loaded before matching starts).
+
+**One hiccup worth recording**: the first attempt to extend the fetch to 2025-05-01 onward silently would have
+skipped most of May 2025 -- the original 35-month fetch's last chunk was a 1-day sliver (`2025-05-01` to
+`2025-05-02`, a `month_chunks` boundary artifact) that had already produced a real `gdac_argo_qc_202505.parquet`
+file, which the resumable "skip if exists" logic then treated as a complete month. Caught before it mattered,
+fixed by deleting the stale partial file and re-running.
+
+### 32.1 Rebuilt matchup table, ±3h window, full range
+
+`smap_cap_argo_matchups_gdacqc.parquet`: 402,047 obsForge near-surface profiles (no range filter) -> 223,351
+kept after the GDAC QC filter (75,932 no GDAC match, 102,764 failed QC) -> 40,609 matches against raw SMAP CAP
+(one corrupted archive file skipped gracefully: `SMAP_L2B_SSS_NRT_57323_D_20251025T011752.h5`, HDF read error,
+not investigated further -- a single file out of 32,511 scanned). Raw (uncorrected) test-period RMSE: **0.897
+PSU** -- consistent with 31's one-month finding, and roughly half of every prior raw-RMSE number in this
+project (~1.5 PSU pre-fix), confirming most of what looked like satellite retrieval error throughout this
+project's history was actually corrupted Argo ground truth.
+
+### 32.2 A training-budget artifact, caught and fixed
+
+First training attempt (on the pre-extension 32,735-row table) showed the rich-feature FFANN doing *worse*
+than raw (RMSE 0.973 vs. raw 0.901) and far worse than the baseline-feature FFANN (0.498) -- a first for this
+project; every previous test had rich features matching or beating baseline. Diagnosed rather than reported
+at face value: the rich model's val_loss was still decreasing at the `train_ffann` epoch cap (300) with no
+early stop triggered, while the baseline model (fewer parameters, presumably an easier loss surface) had
+already converged in fewer epochs. Confirmed by direct test: rerunning with `max_epochs=1500, patience=60`
+(vs. the shared default 300/20) let the rich model early-stop at epoch 1116, dropping its RMSE from 0.973 to
+0.543 -- much more in line with expectations, though still trailing baseline features (0.498) at that smaller
+(pre-extension) sample size.
+
+Root cause: `train_ffann`'s `max_epochs=300, patience=20` defaults (in `train_baseline.py`, shared by every
+FFANN caller in this project) were tuned against the larger range-filtered tables. The GDAC-QC-filtered table
+has ~40% fewer rows, and with 41 rich features vs. baseline's 12, the rich model needs more iterations to
+converge on less data -- the fixed epoch cap silently truncated it without any warning or error, just a
+quietly worse number. Fixed by raising the shared defaults to `max_epochs=2000, patience=50`: early stopping
+already protects every existing caller (`analyze_rich_feature_importance.py`, `float_leakage_diagnostic.py`,
+`test_training_window_sweep.py`, `train_baseline.py`, `train_rich_features_poc.py`) from wasted compute once
+they converge, so raising the ceiling only helps the cases that were being cut off early, and changes nothing
+for the cases that already converged well inside it.
+
+### 32.3 Final result, full extended range (2022-06-01 to 2025-11-30), fixed epoch budget
+
+| method | RMSE | bias | corr |
+|---|---|---|---|
+| raw (no correction) | 0.897 | -0.011 | 0.729 |
+| constant bias | 0.904 | -0.115 | 0.729 |
+| linear regression | 0.642 | -0.016 | 0.799 |
+| FFANN, baseline features | 0.338 | -0.040 | 0.949 |
+| **FFANN, rich features** | **0.302** | -0.048 | 0.960 |
+
+Test set n=22,292 (post-2024-02-29 chronological split). Rich features are back to beating baseline features
+(0.302 vs. 0.338), confirming 32.2's diagnosis -- the earlier reversal was the epoch-budget artifact on a
+smaller sample, not a real property of GDAC-QC-filtered data. **This is the best result this project has
+produced by a wide margin**: every previous rich-feature FFANN test, across every match-window table built on
+the range-filtered obsForge Argo, landed around RMSE 1.1-1.3 PSU. Recovering real Argo QC and delayed-mode
+labels roughly quadruples the apparent skill of the same model architecture on the same satellite data --
+strong, converging evidence (alongside 30's and 31's findings) that a large fraction of this project's
+error budget, throughout its whole history, has been corrupted-label noise rather than genuine satellite-
+retrieval-vs-bulk-salinity physical mismatch.
+
+## 33. Backfilling to 2021-01-01, and a newly-discovered local archive gap
+
+Decided to shift primary reliance to GDAC Argo (real QC, delayed-mode salinity) and raw SMAP CAP going
+forward, and to backfill both back to 2021-01-01 -- the earliest date the local obsForge Argo archive goes
+back to (raw SMAP CAP locally only went back to 2022-05-31 until now). Two backfills launched:
+
+- Raw SMAP CAP, 2021-01-01 to 2022-06-01: same monthly-chunked, stall-detecting downloader as the earlier
+  overnight backfill (DESIGN.md 25/26.4), run unattended in the background.
+- GDAC Argo QC, 2021-01-01 to 2022-06-01: `fetch_gdac_argo_qc.py`, same as 31/32's fetches. Completed in
+  ~25 minutes, 133,192 rows.
+
+**Found a new, previously-unknown local data gap while sanity-checking the GDAC fetch's own output**: Jan 2022
+returned only 834 rows (vs. ~10,000-11,000/month elsewhere in 2021) and Feb-Apr 2022 returned exactly 0. Traced
+directly to disk rather than assumed to be a script bug: `data/common_obsForge/gdas.YYYYMMDD/00/ocean/insitu/
+gdas.t00z.insitu_salt_profile_argo.nc` is simply **missing from the local archive for every cycle-day from
+2022-01-05 through 2022-04-30** (confirmed by checking file presence directly) -- the cycle-day directories
+themselves exist, just without this one file inside them. 2022-01-01 through 01-04 are present; 2022-05-01
+onward resumes normally. This is a different, previously-undiscovered gap from the known Aug-Sep 2022 SMAP
+spacecraft-safe-mode outage (25) -- nobody had looked at obsForge data this early (pre-2022-06) before this
+session, since every prior matchup table in this project started at 2022-06-01. Whether this reflects a real
+upstream Argo/obsForge production gap or just an incomplete local sync was not investigated further -- worth
+revisiting if this ~4-month hole in the 2021-2022 backfill period turns out to matter for any test run on it.
+
+## 34. obsForge-independent GDAC fetch: obsForge undercounts by ~50% even where it has no local gap
+
+Raised directly: why does a *local obsForge* gap block fetching *GDAC* data for that period at all? Answer:
+`fetch_gdac_argo_qc.py`'s design enriches obsForge's existing profile list with real QC -- it never queries
+GDAC independently. If obsForge's local list for a period is empty, there's nothing to enrich, regardless of
+what GDAC itself holds for that place and time.
+
+Checked whether this matters even in the already-covered 2022-06-01 to 2025-11-30 window (used to train every
+model in this project so far, no known local gap there): loaded the GDAC profile index directly (`argopy.ArgoIndex`,
+global, date-filtered only, no obsForge cross-reference) and compared counts.
+
+| source | profile count, 2022-06-01 to 2025-11-30 |
+|---|---|
+| GDAC index (independent) | 601,705 |
+| obsForge-derived (what every model so far has used) | 402,047 |
+
+**obsForge undercounts the true Argo record by ~50%, even in a period with no known local gap.** Consistent
+with obsForge's Argo ingestion path being a real-time GTS/BUFR feed (17.4) rather than the GDAC's complete
+archival record -- not every float's report makes it through GTS relay promptly or at all.
+
+Built `src/fetch_gdac_argo_direct.py`: queries the GDAC index directly for a date range (global, no obsForge
+involvement) and fetches every profile's real QC/delayed-mode salinity, same per-profile fetch logic as
+`fetch_gdac_argo_qc.py`. `src/gdac_qc_filter.py::load_gdac_direct_argo` reshapes this into the same
+(lat, lon, datetime, oceanBasin, depth, salinity) schema `match_to_argo`/`box_average_match_to_argo` expect;
+`build_raw_smap_matchups.py --gdac-direct` wires it in as a third Argo source alongside `--gdac-qc` and the
+plain range-heuristic default.
+
+**Fetch scope and reprioritization**: per direction to prioritize testability, fetched the already-covered
+2022-06-2025-11 range first (529,024 profiles, ~9.5h -- much slower than estimated, likely competing for
+network/CPU with the concurrent SMAP 2021 backfill overnight), ahead of the earlier 2021-01-2022-06 backfill
+(6 months done before reprioritizing, remainder deferred). QC-good (1/2) yield: 354,961/529,024 (67.1%),
+consistent with earlier segment-test rates.
+
+Rebuilt the main 3h matchup table using this fully independent source (`smap_cap_argo_matchups_gdacdirect.parquet`):
+**63,923 matches**, up from 40,609 with the obsForge-gated `--gdac-qc` table (+57%, tracking the ~50% index
+undercount).
+
+### 34.1 Characterizing the ~57% more data: geographic redistribution, not a quality difference
+
+Retrained on the larger table and got slightly *worse* aggregate numbers than the obsForge-gated table despite
+more data (raw RMSE 0.919 vs. 0.897; rich-feature FFANN 0.318 vs. 0.302) -- investigated rather than accepted
+at face value, since more data making things worse needed an explanation.
+
+Fuzzy-matched (5km/30min, not naive exact-key matching -- an initial naive attempt wrongly suggested 99.9% of
+the new set was unseen, an artifact of obsForge and GDAC-index metadata reporting slightly different position/
+time for the same physical profile) the new table's Argo obs against the old table's. Result: 64.3% genuinely
+overlap with what obsForge already had; 35.7% (22,845) are genuinely new profiles GDAC has that obsForge never
+surfaced.
+
+Comparing raw RMSE by latitude band, old set vs. the genuinely-new subset, shows **near-identical per-band
+performance** (e.g. -60/-30: 1.13 vs. 1.12; 0/30: 0.67 vs. 0.71; 60/90: 1.50 vs. 1.45) -- the new profiles
+aren't individually noisier. What differs is the **mix**: the new profiles skew away from the well-covered,
+low-RMSE equatorial bands (42% of the new-only set vs. 49% of the old set) and toward higher latitudes/the
+Southern Ocean (58% vs. 51%), bands that have always had intrinsically higher raw RMSE in this project. Likely
+explanation: obsForge's real-time GTS feed systematically under-samples remote/high-latitude floats relative
+to their true share of the network (plausibly weaker/less prompt relay coverage away from well-traveled mid-
+latitude shipping lanes). The earlier "best result" number was evaluated on a population that quietly
+over-weighted the easier regions; the GDAC-direct number is more representative, not worse-quality.
+
+Checked mid/low-latitude bands specifically for whether the extra profiles improve anything there: no --
+per-band RMSE for new-only profiles in the -30/0 and 0/30 bands is if anything marginally *worse* than the old
+set's (0.64 vs. 0.60, 0.71 vs. 0.67). The benefit in those bands is in volume, not quality: +48-63% more
+matched profiles per band, useful for training density/statistical power, not evidence the existing low/mid-
+latitude data was previously under-measured in quality.
+
+## 35. Lat/lon ocean-basin classifier, to restore a feature GDAC-direct data can't otherwise carry
+
+`load_gdac_direct_argo` had left `oceanBasin` as NaN (GDAC has no equivalent field), silently zeroing out all
+six `basin_0..5` one-hot features (`add_features` computes them as `argo_oceanBasin == code`, always False for
+NaN) -- not a crash, but a quiet loss of a feature previously found to matter for some codes (permutation
+importance: basin_1 ranked 6th of 41 features, basin_2 12th, basin_5 13th, basin_3 21st; basin_0 and basin_4
+were negligible, near-zero ΔRMSE).
+
+Built `src/classify_ocean_basin.py`: a lat/lon rule (Southern Ocean by latitude, then Atlantic/Indian/Pacific
+by longitude), with its 3 threshold values empirically derived and validated against ~40,000 real (lat, lon,
+oceanBasin) triples from the obsForge-derived table, not assumed from a textbook definition. Final rule:
+southern if lat < -40; else Atlantic if -70 <= lon < 20; else Indian if 20 <= lon < 125; else Pacific.
+**89.3% overall agreement** with real obsForge codes (basins 1/2/3/5 combined; basin_0's marginal/enclosed seas
+are geographically scattered and not capturable by a simple rule, basin_4/Arctic is indistinguishable from
+high-latitude Atlantic by threshold alone -- both fine to drop given their established negligible importance).
+Widening the Atlantic's western boundary to swallow the Gulf of Mexico/Caribbean (lon >= -100) was tried and
+made overall accuracy *worse* (87.8% vs. 89.3%) by pulling in genuine Pacific points -- reverted.
+
+Wired into `load_gdac_direct_argo` for future builds, and used to patch `argo_oceanBasin` in the already-built
+`smap_cap_argo_matchups_gdacdirect.parquet` in place (no need to re-run the raw-SMAP scan or Argo matching --
+oceanBasin is carried-through metadata, not a matching input). Retrained:
+
+| method | no basin (n=32,470 test) | with classifier (n=32,470 test) |
+|---|---|---|
+| linear regression | 0.717 | **0.670** |
+| FFANN, baseline features | 0.376 | 0.373 |
+| FFANN, rich features | 0.318 | 0.314 |
+
+Linear regression recovered ~6.6% of its RMSE, exactly as expected (no nonlinear layers to route around a
+missing categorical signal); the FFANNs improved only marginally, having already partially compensated via
+lat/lon directly. The remaining gap vs. the obsForge-gated table's rich-feature RMSE (0.314 vs. 0.302) is now
+almost entirely 34.1's population-composition effect (more representative high-latitude coverage), not a
+feature-engineering or data-quality gap.
+
+## 36. Full 2021-2025 archive: an OOM discovered and worked around by chunking the build
+
+With both archives finally aligned -- raw SMAP CAP backfilled to 2021-01-01 (35, including a fixed March 2021
+that had given up after 5 stall-retries during the original backfill), and GDAC-direct Argo fetched for the
+same full range (34, run in parallel with the SMAP backfill specifically to test whether concurrent local jobs
+were the stall cause -- they weren't: the SMAP downloader's last chunk completed cleanly *during* that overlap,
+and stalls recurred even on a later night with nothing else running, pointing to intermittent time-of-day-
+correlated server load on PO.DAAC's end rather than local contention) -- rebuilt the main matchup table over
+the complete 2021-01-01 to 2025-11-30 span.
+
+**First two attempts silently died**: real CPU usage (14:50 wall time, matching the expected cost), RSS
+climbing steadily past 47GB, then the process vanished -- zero output, destination file untouched, no
+traceback. Confirmed as a genuine OS-level Jetsam (memory pressure) kill, not a script bug, by finding the
+actual JetsamEvent report in `/Library/Logs/DiagnosticReports/` and matching the killed PID's cpuTime against
+the failed run's own reported CPU time. `load_raw_smap_dir` keeps every orbit file's full per-pixel DataFrame
+in memory simultaneously for the whole requested date range (`file_dfs`) -- fine at the ~42-month scale used
+throughout this session, but 59 months of raw JPL CAP swaths (2021-01 to 2025-11) pushed past what this
+machine's memory (96GB, already under real pressure -- swap sitting at ~90%+ used from the session's
+accumulated activity) could sustain, even before accounting for that other jobs might be running.
+
+**Worked around by chunking, not by fixing the memory-heavy loader**: split the build into three ~20-month
+sub-ranges (2021-01/2022-09, 2022-09/2024-05, 2024-05/2025-11), each run separately (peaking around 30-44GB,
+comfortably under the failure threshold), then concatenated and deduplicated on
+`(argo_lat, argo_lon, argo_datetime)` -- zero boundary duplicates found, confirming the ~3h match window's
+boundary-adjacent edge effect (an Argo obs within 3h of a chunk cutoff could in principle miss a same-side
+match) didn't materialize in practice here. Final table: **94,214 matches**, 2021-01-01 to 2025-11-29 --
++30,291 over the 2022-06-2025-11-only table (63,923), from the newly backfilled 2021-2022 period.
+
+Not fixed: `load_raw_smap_dir`'s memory scaling with date-range length. A real fix (streaming/incremental
+matching instead of holding every file in memory, or capping per-chunk memory automatically) would remove the
+need for this manual chunking if the archive keeps growing -- deferred, since manual chunking is a working,
+low-effort solution at the current archive size.
+
+### 36.1 Retrained on the full range: new best-ever result
+
+| method | 2022-06/2025-11 only (n=32,470 test) | full 2021-2025 (n=32,470 test) |
+|---|---|---|
+| raw | 0.919 | 0.919 (identical -- same test set) |
+| linear regression | 0.670 | 0.681 |
+| FFANN, baseline features | 0.373 | 0.353 |
+| FFANN, rich features | 0.314 | **0.299** |
+
+Test set is byte-identical between the two runs (n=32,470, everything after the 2024-02-29 chronological split
+cutoff) since all of the newly-backfilled 2021-2022 data lands in the training period -- a clean isolation of
+"more training data, same eval set." Both FFANNs improved (baseline -5.4%, rich -4.8%); linear regression
+degraded marginally, plausibly noise given it has little capacity to exploit the extra data. **RMSE 0.299 is
+the best result this project has produced**, finally surpassing the original obsForge-gated table's 0.302 --
+on real QC, delayed-mode salinity, the complete independent GDAC record (not obsForge's ~50%-undercounted
+version of it), and a validated basin feature, across the full 5-year span this project's local archives cover.
+
+## 37. Extended to the true archive limits: 2020-09-23 to 2026-09-12
+
+Extended both archives further, in both directions from the 2021-2025 span: forward to the present (raw SMAP
+CAP to 2026-09-12, GDAC-direct Argo to 2026-09-13) and backward toward 2020. Forward and backward GDAC Argo
+fetches ran fine at the established per-month rate. The SMAP backward fetch found a real product boundary:
+**`SMAP_JPL_L2B_NRT_SSS_CAP_V5` has zero files before 2020-09-23** (Jan-Aug 2020 chunks correctly reported
+"completed cleanly" -- nothing to download, not a failure -- and September itself is a partial month starting
+the 23rd) -- an actual dataset-availability limit, not a download gap, confirmed by direct per-month file
+counts. GDAC Argo data for Jan-Aug 2020 was still fetched (real Argo obs exist for that period) but has no
+SMAP counterpart to match against, so it contributes nothing to the matchup table.
+
+Rebuilding the matchup table over this ~72-month span (vs. the 59 months that already needed 3-way chunking in
+36) was chunked into four ~18-month pieces from the start, same reasoning: `load_raw_smap_dir`'s memory scales
+with date-range length, so a range this size would predictably repeat 36's OOM. Each chunk peaked at 25-44GB
+(RSS monitored live via a polling loop throughout every chunk of both this and the prior rebuild) and completed
+cleanly; concatenated and deduplicated with zero boundary matches, same as before. Final table: **112,597
+matches**, 2020-09-23 to 2026-09-12.
+
+Retrained: test set grew to n=45,387 (vs. 32,470 previously) since the chronological split's fixed 2024-02-29
+val/test cutoff now leaves a longer test tail (through 2026-09 instead of 2025-11) -- no longer a pure
+same-test-set comparison, but a genuinely larger and more temporally demanding one.
+
+| method | 2021-2025 (n=32,470 test) | full 2020-2026 (n=45,387 test) |
+|---|---|---|
+| raw | 0.919 | 0.916 |
+| linear regression | 0.681 | 0.673 |
+| FFANN, baseline features | 0.353 | 0.342 |
+| FFANN, rich features | 0.299 | **0.298** |
+
+Every metric improved slightly despite the harder, 40%-larger, 2.5-year test window -- a good sign of genuine
+robustness rather than a favorable test-set draw. **[Correction, see 40.3: single runs vary by about 0.005 PSU
+RMSE (std across random initializations), so the 0.299 -> 0.298 change here, and similar sub-0.005 differences
+elsewhere in 36/37, are within noise -- not evidence of improvement.]** **RMSE 0.298 is the new best result for this project**, on
+the fullest dataset assembled to date and the true limits of what's locally available (bounded by the SMAP CAP
+product's actual 2020-09-23 start and the current date on the recent end).
+
+## 38. Why not go back to 2015 (SMAP's launch)? NRT vs. non-NRT are different products, not just different latency
+
+SMAP itself launched in 2015, so 37's 2020-09-23 floor raised an obvious question: is that a real limit, or an
+artifact of only having looked at one specific PO.DAAC collection? Checked directly against NASA's CMR
+(Common Metadata Repository) rather than assuming.
+
+**Two separate SMAP CAP L2B collections exist, with very different histories**:
+
+| collection | actual granule coverage |
+|---|---|
+| `SMAP_JPL_L2B_NRT_SSS_CAP_V5` (what this project has used throughout) | a brief pilot in June-July 2016 (896 granules total), then nothing until continuous operation began 2020-09-23 |
+| `SMAP_JPL_L2B_SSS_CAP_V5` (non-NRT / delayed, science-reprocessed) | continuous full-mission coverage, ~3,700-5,300 granules/year, every year from April 2015 onward including through 2025 |
+
+The collection's own catalog metadata (`time_start`) claims 2015-04-01 for *both* -- misleading for the NRT
+one, since that's inherited from the mission's overall record rather than reflecting when NRT granules actually
+exist. Confirmed via direct per-year and per-month CMR granule counts (`cmr-hits` header), not just the
+collection-level metadata, given the metadata's own claim didn't match what `podaac-data-downloader` actually
+returned for 2020-01 through 2020-08 (zero files, correctly).
+
+**So SMAP CAP data back to 2015 exists -- just not as NRT.** Tested whether that distinction actually matters
+(same skepticism-before-acting pattern as 17's real-time-vs-delayed-mode Argo test) rather than assuming NRT
+and non-NRT are the same retrieval at two latencies. Downloaded both products' files for the same 16 orbit
+revolutions (2022-05-31/06-01, REVs 39157-39172 -- a day already in the local archive) and compared
+`smap_sss` pixel-by-pixel. One format wrinkle: NRT splits each revolution into separate ascending/descending
+files (812 along-track rows each), while non-NRT bundles both into one file (1624 rows) -- confirmed via
+`row_time` continuity that the first 812 rows are the ascending half and the last 812 the descending half,
+matching NRT's own split, before comparing.
+
+**Result: NRT and non-NRT are meaningfully different retrievals, not the same algorithm at two latencies.**
+Over 514,806 co-located pixels: mean diff (non-NRT minus NRT) +0.043 PSU, but std 0.75 PSU and median
+|diff| **0.116 PSU** -- only 0.02% of pixels are bit-identical, 94.4% differ by more than 0.01 PSU, 54.7% by
+more than 0.1 PSU, and 6.9% by more than a full PSU (max 29.2 PSU). The median discrepancy alone is roughly a
+third of this project's best model RMSE (0.298, 37) -- comparable in size to the actual signal being modeled,
+not a rounding-level difference.
+
+**Decision: not backfilling with non-NRT data.** The deployed use case is real-time operational bias
+correction, so the model's actual input is always NRT SMAP -- unlike Argo (17.1), where the target label can
+safely use the best available (delayed-mode) data since Argo is never a live model input. Training years of
+2015-2020 on non-NRT retrievals while the model only ever sees NRT operationally would reintroduce exactly the
+kind of train/deploy satellite-side mismatch this project has otherwise been careful to avoid. 2020-09-23
+remains the practical, correct start of the usable local archive for this project's actual purpose -- not an
+artifact of an incomplete download, and not worth working around given what the comparison found.
+
+## 39. Generating bias-corrected IODA files for assimilation (2025-12-10 to 2026-01-19)
+
+First real deliverable aimed at actual use, not just validation: bias-corrected SMAP SSS observation files in
+the same IODA format as `common_obsForge/gdas.YYYYMMDD/HH/ocean/sss/gdas.tHHz.sss_smap_l2.nc`, meant to be fed
+to an assimilation run in place of the originals. Three-phase plan, each phase gated on confirming the
+previous one actually worked rather than assumed.
+
+### 39.1 Confirmed the existing IODA files can be replicated from raw SMAP files on hand
+
+Inspected one file's schema directly: root dimension `Location`, groups `MetaData` (dateTime int64 seconds-
+since-1970, latitude/longitude float32, oceanBasin int32), `ObsValue`/`ObsError`/`PreQC` each holding
+`seaSurfaceSalinity`. Critically, the root attribute **`obs_source_files`** lists the exact raw JPL CAP swath
+filenames obsForge ingested for that cycle -- removing any guesswork about which raw files feed which cycle.
+
+Loading those exact files with `build_raw_smap_matchups.load_raw_smap_file` and concatenating in the
+attribute's listed order reproduced latitude/longitude/ObsValue/PreQC exactly... after finding one extra
+filter: obsForge drops a handful of pixels with `sss` exactly `0.0` (a degenerate retrieval near Hudson Bay in
+the test cycle -- passes the fill-value check but is not a real salinity) that our own `load_raw_smap_file`
+keeps. With `sss > 0` added, every field matched exactly (confirmed on the first cycle and three more spot
+checks across the range, including an 18Z cycle and one near the far end of the requested range) except
+`dateTime`, off by up to +/-64 seconds -- not chased further, negligible against a 6h DA cycle window.
+`ObsError` also confirmed to equal the raw file's `smap_sss_uncertainty` field directly.
+
+### 39.2 Generated the bias-corrected files
+
+`src/train_and_save_correction_model.py`: retrained the rich-feature FFANN (same architecture/split as
+`train_rich_features_poc.py`) on the full GDAC-direct matchup table and saved model weights + the feature
+Standardizer's mean/std + the `RICH_FEATURES` column order to `rich_correction_model.pt`, since no checkpoint
+had existed before (train_rich_features_poc.py only ever trained in-memory).
+
+`src/generate_bias_corrected_ioda.py`: for each cycle, reproduces the exact obs population per 39.1, computes
+the same rich-feature set directly from the raw per-pixel fields (`load_raw_smap_file` already extracts
+everything `RICH_EXTRA_FEATURES` needs) -- using the **original file's own `oceanBasin`** for the basin_0..5
+one-hot rather than `classify_ocean_basin.py`'s ~89%-accurate approximation, since the real obsForge-computed
+value is sitting right there in the file being replaced. **[Correction, see 40.2: this was a mistake. The model
+was trained on the classifier's basins, so feeding it obsForge's real ones was out-of-distribution for ~10.7% of
+observations. Superseded by a model with no basin inputs, 40.]** Copies the original file byte-for-byte and overwrites
+only `ObsValue/seaSurfaceSalinity`, and only for **QC-pass (`PreQC==0`) rows** -- the model was trained
+exclusively on QC-pass satellite-Argo matches, so applying it to QC-fail rows would be out-of-distribution;
+those keep their original value; the DA system's own PreQC-based downweighting handles them either way.
+
+One implementation snag: netCDF4-python in this environment couldn't reopen these particular HDF5-backed
+NETCDF4 files in write mode (`"Can't write file"`, independent of permissions or file locking) -- root-caused
+by testing raw h5py against the same file, which opened and wrote it fine (a NETCDF4 file is HDF5 underneath,
+same group model), so the script uses h5py for the copy-and-modify step instead of fighting the netCDF4
+library's write path.
+
+Result: **144 of 164 requested cycles generated** (2025-12-10 00Z to 2026-01-19 18Z), written to a separate
+`data/bias_corrected_obsForge/` tree with the same layout, none of the originals touched. 20 cycles skipped.
+**[Correction, see 40.4: this originally said 11 missing + 1 mismatch, all in Jan 2026 -- that came from a
+run whose output I had truncated. The full breakdown is 18 cycles with no original IODA file, spread across
+Dec 2025 and Jan 2026 (e.g. 3 on 2025-12-12, 3 on 2026-01-01, 3 on 2026-01-15), plus 2 single-row mismatches
+(2025-12-22 12Z and 2026-01-17 06Z, raw = ioda + 1 in both, the near-zero-salinity edge case).]** Verified on the first cycle that every
+field except `ObsValue/seaSurfaceSalinity` is byte-identical to the original, and that the changed rows are
+exactly the QC-pass ones.
+
+### 39.3 Bias comparison against real Argo
+
+`src/compare_ioda_bias.py`: loads each generated cycle's QC-pass obs from both the original and corrected
+files, matches each independently against GDAC-direct Argo (same `match_to_argo` nearest-neighbor logic as the
+rest of this project, 50km/+/-3h) for the 2025-12-10 to 2026-01-19 window -- a check on the actual files
+intended for assimilation. This window is after the 2024-02-29 split cutoff, so the model never trained on it,
+but it uses the same matching and Argo source as the held-out test set and very likely overlaps heavily with it
+(overlap measured in 41.3: 588 of the 590); it is not a separate, independent validation sample.
+
+| | n | bias | std | RMSE |
+|---|---|---|---|---|
+| Original (raw) SSS | 590 | -0.080 | 0.983 | 0.985 |
+| Bias-corrected SSS | 590 | -0.036 | 0.302 | **0.304** |
+
+Same 590 matched obs both ways (only the SSS value differs). **69% RMSE reduction**, and the corrected RMSE
+(0.304) lines up closely with the model's own held-out test performance (0.293-0.298, 37) -- as expected if
+these matches are largely a subset of that test set. This shows the correction was applied correctly to the
+generated files and holds on data the model did not train on; it is not evidence of generalization to a
+separate sample.
+
+## 40. Do the basin inputs earn their place? Feature importance, a train/inference mismatch, and a no-basin model
+
+Started as a question about which SMAP inputs matter, and turned into finding and fixing a mistake in 39.
+
+### 40.1 Permutation importance on the current table
+
+Re-ran `analyze_rich_feature_importance.py` (permutation importance, 10 shuffles per feature) on the full
+2020-2026 GDAC-direct table (45,387 test points); added `--matchups-path`/`--out` so it no longer silently
+overwrites the older results (still in `rich_feature_importance.parquet`; new run in
+`rich_feature_importance_gdacdirect.parquet`). ΔRMSE in PSU when the column is shuffled in the test set:
+
+| rank | input | ΔRMSE | rank | input | ΔRMSE |
+|---|---|---|---|---|---|
+| 1 | sat_sss | 1.243 | 7 | sat_smap_sss_uncertainty | 0.137 |
+| 2 | sat_anc_sss | 0.529 | 8-9 | lon_cos / lon_sin | 0.126 / 0.118 |
+| 3 | sat_anc_sst | 0.477 | 10-11 | basin_5 / basin_1 | 0.088 / 0.074 |
+| 4 | sat_lat | 0.276 | 12 | doy_sin | 0.053 |
+| 5-6 | basin_3 / basin_2 | 0.225 / 0.209 | 13-14 | sat_inc_aft / sat_inc_fore | 0.045 / 0.027 |
+
+Everything else is <= 0.023: wind speeds, land fractions, brightness temperatures, noise-equivalent
+temperatures; the azimuth/antenna-azimuth/wind-direction fields, ice concentration and ascending flag are
+~0 (<= 0.002). `basin_0` and `basin_4` are exactly 0 *by construction* (the classifier never emits those
+codes), not a finding.
+
+What is shuffled: only the one column of the standardized test matrix, replaced by a random permutation of its
+own values (distribution unchanged, row pairing broken); the Argo target and the satellite salinity added back
+to the model's output are not shuffled, so the `sat_sss` score measures the model's *correction* depending on
+its input, not removal of the retrieval itself. Row order is irrelevant (the FFANN scores rows independently).
+
+Caveat corrected during this discussion: I had said correlated inputs are *understated*; that holds when the
+model can fall back on a redundant partner, but shuffling one of several derived features also creates
+impossible combinations (e.g. a tropical latitude with a Southern Ocean basin flag) the model never saw, which
+can *inflate* the score. Lat/lon/basin are mutually derived here, so their ranks are ambiguous in both
+directions. `sat_lat` moving from ~0 (earlier run) to rank 4 is plausibly this, but untested. Grouped
+shuffling (lat, lon, basin together) would separate real location signal from the artifact; not run.
+
+### 40.2 What basin adds, and the mismatch it caused in 39
+
+In the GDAC-direct table the basin flags are a deterministic function of lat/lon
+(`classify_ocean_basin.py`: south of 40S, else three longitude bands), so they carry no information beyond what
+the model already receives (latitude directly, longitude as sin/cos); at most they give hard step boundaries
+the network would otherwise have to build. In the original obsForge data `oceanBasin` was a richer
+coastline-following mask (marginal seas, Arctic), also a function of lat/lon but too intricate for a small
+network to learn from raw coordinates -- the classifier matches it only 89% of the time.
+
+That is the problem with 39: the model is trained on classifier-derived basins (`basin_0`/`basin_4` always 0),
+but the generated IODA files fed it the file's real obsForge `oceanBasin`. Measured over 12 cycles (463,246
+QC-pass observations): obsForge's basin differs from the classifier's on **10.7%** of observations (code 0:
+0.07%, code 4: absent -- so mostly ordinary boundary disagreement, not the untrained inputs); the correction
+shifts by std **0.129 PSU** between the two (mean +0.001), >0.2 PSU on 6.0% of observations, max 2.35 PSU.
+39's reasoning ("more accurate, sitting right there in the file") ignored that the model never saw that
+distribution.
+
+### 40.3 Ablation: with vs. without basin inputs, 5 random initializations each
+
+`src/compare_basin_ablation.py` (same split and test set; torch seeded per run -- full-batch training is
+otherwise deterministic; per-run results in `basin_ablation_results.parquet`):
+
+| model | inputs | test RMSE mean +/- std | range |
+|---|---|---|---|
+| rich, with basins | 41 | 0.2939 +/- 0.0049 | 0.290-0.302 |
+| rich, no basins | 35 | 0.2965 +/- 0.0045 | 0.291-0.302 |
+| baseline, with basins | 12 | 0.3455 +/- 0.0047 | 0.340-0.351 |
+| baseline, no basins | 6 | 0.3732 +/- 0.0110 | 0.363-0.391 |
+
+Rich model: the 0.0026 gap is smaller than the standard error of the difference (~0.003) and the ranges nearly
+coincide -- no detectable effect (effects up to ~0.006 not excluded at 5 seeds). Baseline model: removing the
+basins clearly hurts (+0.028, non-overlapping ranges) -- with only 6 inputs nothing else carries regional
+information, whereas the rich model's ancillary SST/salinity and uncertainty fields stand in for it. Consistent
+with 35's finding that basins helped linear regression (no nonlinearity to compensate) but barely helped the
+FFANNs. Decision: drop the basin inputs from the deployed rich model.
+
+**Noise caveat for earlier results**: seed-to-seed std is ~0.005 PSU, so differences of that size or smaller
+reported elsewhere (36.1/37's 0.299 -> 0.298; likely part of 35's 0.314 vs. 0.302) are not evidence of
+improvement. Conclusions in 29-34 about differences of ~0.01+ are less affected.
+
+### 40.4 No-basin model, regenerated IODA files, and the Argo comparison
+
+- `train_and_save_correction_model.py` gained `--no-basin` and `--seed`; the no-basin default output is
+  `rich_correction_model_nobasin.pt` so the original checkpoint is never overwritten. Seed 0, fixed in advance
+  (not chosen by test score): test RMSE 0.2939, 35 inputs. Re-running the ablation's seed 0 reproduced it exactly.
+- Regenerated all 144 cycles with it into **`data/bias_corrected_obsForge_nobasin/`** (the earlier with-basin
+  set and the originals untouched; `bias_correction_model` attribute in each file names the checkpoint). Same
+  20 cycles skipped. **Correction to 39.2's count**: its "11 missing + 1 mismatch, all Jan 2026" came from a
+  run whose output I had truncated. Full breakdown, from an untruncated run: **18** cycles with no original
+  IODA file (Dec 2025 and Jan 2026 both) and **2** single-row mismatches (2025-12-22 12Z, 2026-01-17 06Z;
+  raw = ioda + 1, the near-zero-salinity edge case).
+- `compare_ioda_bias.py` gained `--out-suffix` (so a second run doesn't overwrite the first's matchup files).
+  Same 590 Argo matches for all three:
+
+| | n | bias | std | RMSE |
+|---|---|---|---|---|
+| Original SSS | 590 | -0.080 | 0.983 | 0.985 |
+| Corrected, with basin inputs (39) | 590 | -0.036 | 0.302 | 0.304 |
+| Corrected, no basin inputs | 590 | -0.042 | 0.262 | **0.266** |
+
+Read this cautiously. A paired bootstrap (5,000 resamples) on RMSE(with) - RMSE(without) gives +0.038 with a
+95% CI of [+0.002, +0.091] -- barely excludes zero. Mechanism check: 85 of the 590 matched pixels (14.4%) have
+an obsForge basin differing from the classifier's; the no-basin model is better on those (0.469 -> 0.410) *and*
+on the 505 where the basins agree and the with-basin model saw exactly the inputs it was trained on (0.267 ->
+0.233). So most of the gap is not the basin mismatch; it is more plausibly ordinary model-to-model variation
+(different initialization) on a small sample -- on the 45k held-out test set the two models are
+indistinguishable (40.3). Not checked: how much other seeds vary on these same 590 points. The no-basin set is
+still the one to use, because it removes a known inconsistency at no measured accuracy cost, but "RMSE 0.266"
+should not be quoted as a demonstrated improvement over 0.304.
+
+Scripts touched: `analyze_rich_feature_importance.py`, `train_and_save_correction_model.py`,
+`compare_ioda_bias.py` (options added), `compare_basin_ablation.py` (new). Nothing committed.
+
+## 41. Does more recent training data help? And an ensemble-corrected IODA set
+
+Follows 40: with the basin inputs dropped, the remaining question for the files meant for assimilation was
+whether the model should be trained on more recent data. The model behind the IODA files (A) was trained only
+through 2023-12-31 (63,620 rows; 3,316 for validation), so it never saw the 32,953 matches from March 2024
+to 9 December 2025 -- about half again as much data, and the closest in time to the period being corrected.
+
+### 41.1 Recency comparison (`src/compare_recency_training.py`)
+
+Both models use the 35-input no-basin set, 5 seeds each, scored on the same untrained rows (all
+`sat_datetime` >= 2025-12-10, straight from the raw-SMAP/GDAC-Argo matchup table -- no IODA files):
+- **A (old split)**: train <= 2023-12-31, validate to 2024-02-29.
+- **B (recent split)**: train <= 2025-09-30 (96,495 rows), validate 2025-10-01 to 2025-12-09 (3,415 rows).
+
+Scoring only the IODA window (2025-12-10 to 2026-01-19, 1,961 rows) gives little statistical power, and B's
+training now overlaps most of the old 45k test set, so B can't be scored there. The first run was stopped and
+restarted with the evaluation widened to also include everything from 2026-01-20 on ("later", 10,452 rows),
+reported separately and combined. Raw satellite RMSE: window 0.961, later 0.900, all 0.910.
+
+| held-out rows | A mean +/- std (min-max) | B mean +/- std (min-max) | A - B, seed-averaged (95% CI) |
+|---|---|---|---|
+| window, n=1,961 | 0.2704 +/- 0.0029 (0.265-0.273) | 0.2657 +/- 0.0033 (0.261-0.270) | +0.002 (-0.003, +0.007) |
+| later, n=10,452 | 0.2758 +/- 0.0091 (0.268-0.292) | 0.2594 +/- 0.0036 (0.255-0.265) | +0.012 (+0.007, +0.016) |
+| all, n=12,413 | 0.2749 +/- 0.0078 (0.269-0.289) | 0.2604 +/- 0.0035 (0.256-0.266) | +0.010 (+0.006, +0.014) |
+
+(Positive = B better; the last column is a paired 5,000-resample row bootstrap on seed-averaged predictions.)
+
+- **Window**: B is better or tied in all 5 seeds, but the difference is inside the uncertainty at ~2k rows --
+  the window alone cannot show an effect.
+- **Later rows**: B wins every seed and the interval excludes zero (about 6% lower RMSE). Model A is also less
+  stable there (seed 3: 0.2916; std 0.009 vs. 0.004 for B).
+- Both models score ~0.26-0.28 on these rows, lower than the ~0.29-0.30 on the old 45k test set, while raw RMSE
+  is about the same (0.91 vs. 0.92). Not investigated.
+- Caveat: the "later" rows run through September 2026, so B's advantage there mixes "more data" with "less
+  staleness" -- the two are not separated by this design. [Resolved in 45: recency, not volume.]
+
+**Seed-averaging is as large an effect as recency.** Averaging the five seeds' predictions lowers RMSE on the
+same rows by 0.011-0.020: A window 0.2704 -> 0.2572, B window 0.2657 -> 0.2549; A later 0.2758 -> 0.2560, B later
+0.2594 -> 0.2441. The IODA files so far came from a single network.
+
+### 41.2 Ensemble-corrected IODA files
+
+- `src/train_and_save_ensemble.py`: trains the five B members (seeds 0-4, same train set so one shared
+  Standardizer) and saves them in one checkpoint, `rich_correction_ensemble_recent_nobasin.pt`. Members score
+  0.256-0.266 on the 12,413 untrained rows; their mean scores **0.2458** (bias +0.003).
+- `generate_bias_corrected_ioda.py` now accepts single-model or ensemble checkpoints and averages the members'
+  predicted corrections; behavior for single-model checkpoints is unchanged.
+- Output: **`data/bias_corrected_obsForge_ensemble/`**, 144 of 164 cycles, same 20 skipped as before (18 with no
+  original file, 2 one-row mismatches). The original files, `bias_corrected_obsForge/` (with basins) and
+  `bias_corrected_obsForge_nobasin/` were not touched. Verified on one cycle: every field except
+  `ObsValue/seaSurfaceSalinity` is byte-identical to the original; only QC-pass rows changed (49,135 of 49,148 --
+  the 13 with a missing input field stay uncorrected); the `bias_correction_model` attribute names the checkpoint.
+
+Argo comparison, same 590 matches for every row (`compare_ioda_bias.py`, now with `--out-suffix`):
+
+| satellite SSS | bias | std | RMSE |
+|---|---|---|---|
+| Original (obsForge) | -0.080 | 0.983 | 0.985 |
+| Corrected, with basins, trained to 2023 (39) | -0.036 | 0.302 | 0.304 |
+| Corrected, no basins, trained to 2023 (40.4) | -0.042 | 0.262 | 0.266 |
+| Corrected, ensemble of 5, trained to Sep 2025 | -0.012 | 0.258 | **0.258** |
+
+The 0.258 vs. 0.266 gap is not distinguishable at 590 points (the earlier bootstrap on 0.304 vs. 0.266 had a
+95% interval of roughly +/-0.04), and 41.1 found no detectable difference between A and B on this window. The
+ensemble's measurable advantage is on the larger untrained set (41.1). The window is untrained for this model, so
+0.258 is a fair held-out number -- but see 41.3 for why it is not an independent one.
+
+### 41.3 How much do the 590 overlap the test set, and why only 590?
+
+- Of the 590 IODA-comparison matches, **588 (99.7%)** are rows of the held-out test split with the same Argo
+  profile *and* the same satellite pixel; none are in train/validation; 2 are not in the matchup table at all
+  (cause not checked). So the 590 are essentially a subset of the test set, not an independent sample.
+- Conversely they are only about 30% of the test rows in the window (590 of 1,966 -- 1,961 by the
+  `sat_datetime` criterion used in 41.1; the two counts differ because 41.1 selects on `sat_datetime` and
+  this on the Argo profile time). The reason: the original IODA cycles draw on only about a third of the raw
+  swath files -- 99 distinct source files referenced for 2025-12-10..19 against 273 raw files in the archive
+  for those days (36%). It is not an ascending-only effect (sources listed: 58 ascending, 41 descending; ascending
+  share 52% in the 590 vs. 49% in the rest). Why obsForge ingests only about a third of the files was not
+  determined, and is not something this project changes.
+
+Side note: `generate_bias_corrected_ioda.py` writes `bias_correction_summary.parquet` to a fixed path, so each run
+replaces the previous run's summary (earlier runs' summaries were already gone). Scripts new or changed:
+`compare_recency_training.py` (new), `train_and_save_ensemble.py` (new), `generate_bias_corrected_ioda.py`.
+Nothing committed.
+
+### 41.4 Where `sat_anc_sss` and `sat_anc_sst` come from (documentation findings)
+
+Asked how the two ancillary inputs are generated -- they rank 2nd and 3rd in permutation importance (40.1).
+Sources: the raw files' own variable/global attributes (V5 NRT, a 2025-12-10 file) and JPL's *SMAP Salinity
+and Wind Speed Data User's Guide, Version 4.2* (Fore et al., Jan 2019; read via a copy hosted at
+gmao.gsfc.nasa.gov). **The guide is for V4.2, not the V5 product used here**; I could not load the V5 PO.DAAC page
+or locate a V5 guide (searches returned the dataset pages but not the ATBD/guide text).
+
+- **Neither is a SMAP measurement.** JPL's pre-processing collocates outside datasets with the L1B brightness
+  temperatures and with the L2B swath cells: HYCOM SSS, NCEP GDAS wind speed/direction, NOAA optimum
+  interpolation SST, and NOAA WaveWatch III significant wave height (the last always fill in these files, 23).
+  Each is matched "at the approximate time of the SMAP observations". The files record their ancillary source
+  paths per revolution (`ANC_SSS_FILE`, `ANC_SST_FILE`, ... under an NRT-pipeline directory), i.e. they are built
+  per orbit in the NRT chain.
+- **`anc_sst`**: V5 file long_name "NOAA Optimum Interpolation sea surface temperature" (K); V4.2 guide: NOAA OI
+  SST collocated to the swath cell. Neither names the OI version, resolution, or which analysis is used in NRT.
+  In the retrieval it is an input to the brightness-temperature forward model (the geophysical model function
+  takes SST, wind direction and wave height); it is not solved for.
+- **`anc_sss`**: V4.2 guide: "the HYCOM ancillary SSS collocated to the particular [swath cell]". V5 file
+  long_name: "Ancillary salinity used for high-winds processing, **either SMAP or HYCOM**" -- what "SMAP" means
+  there, and when each is used, is **undocumented in anything I found; unresolved**.
+- **How it enters (V4.2)**: the main retrieval (eq. 3.7) leaves salinity unconstrained and only puts a
+  +/-1.5 m/s prior on wind speed around the NCEP value, so `anc_sss` does not enter `smap_sss`. It does enter the
+  separate high-wind retrieval (eq. 3.8), which fixes salinity at `anc_sss` and fits wind speed/direction --
+  `smap_high_spd`, `smap_high_dir`, `smap_high_dir_smooth` are therefore functions of it. The guide warns that errors in
+  the ancillary salinity map into those wind speeds (erroneously high winds near the Amazon and other major river
+  outflows). The guide also uses HYCOM as its comparison reference for `smap_sss` and for its uncertainty field.
+- **Other fields from the same metadata**: `anc_spd` is NCEP 10 m wind speed scaled by 1.03; `anc_dir` the NCEP
+  direction (oceanographic convention); the ice map is NCEP sea ice.
+
+Two cautions for interpreting `sat_anc_sss` as a model input:
+1. It is a model salinity field independent of the retrieval's own physics (in V4.2), which is plausibly why it is
+   so informative about the retrieval's error. If V5's "SMAP" branch is a satellite-derived field, that
+   independence may not hold in places -- unresolved.
+2. *General knowledge, not from the documentation read here*: operational HYCOM salinity analyses assimilate in-situ
+   profiles, which include Argo. If that applies to the HYCOM product used, `anc_sss` carries Argo information, and
+   part of what the model learns is HYCOM's analysis rather than SMAP physics. Legitimate as an operational
+   input (the field is in the NRT product) but worth knowing before reading its importance as a SMAP-error signal;
+   not verified, including which HYCOM product/latency JPL uses in NRT.
+
+Also noted while collecting the input descriptions: the direction/angle inputs (azimuths, antenna azimuths, wind
+direction) enter the model as raw degrees rather than sine/cosine, so the 0/360 wrap is not handled; this may
+partly explain their near-zero importance (untested).
+
+## 42. Deriving salinity from the brightness temperatures instead of correcting the SMAP product
+
+The question: could the model bypass `sat_sss` (and `sat_smap_sss_uncertainty`) and derive salinity from the
+brightness temperatures, using the ancillary fields SMAP supplies? Tested with an input-group "ladder"
+(`src/ladder_tb_retrieval.py`) and a follow-up isolating one confound (`src/climatology_input_test.py`).
+
+### 42.1 Why a baseline is needed, and how big the real bar is
+
+With no `sat_sss`, the target is Argo salinity itself (std 1.06 PSU) and a small network would first have to
+rebuild the global salinity pattern before any brightness-temperature signal could show. So the network
+predicts Argo minus a baseline. RMSE vs. Argo on the standard test split (45,387 rows), for context:
+
+| predictor | RMSE |
+|---|---|
+| constant (training mean) | 1.072 |
+| raw SMAP `sat_sss` | 0.916 |
+| crude climatology, only on the 96% of rows whose 5x10deg-month cell was populated | 0.382 |
+| hierarchical climatology, all rows (below) | 0.433 |
+| **`anc_sss` (HYCOM) used directly** | **0.330** |
+| existing corrected model (40.3, 5 seeds) | 0.2965 +/- 0.0045 |
+
+The bar is not the raw product (0.92): HYCOM alone is 0.33, and the corrected model is only ~10% better than
+that (see 41.4's caveat that HYCOM may assimilate Argo, which would make it not independent of the targets).
+
+Climatology: hierarchical cell means of Argo salinity over the **train split only** (5x10deg x month, falling
+back to 10x20deg x month, 10deg-lat x month, then the global mean when a cell has < 5 observations). For train
+rows it is **leave-one-out** -- otherwise each row's own Argo value sits inside its baseline: train RMSE 0.408
+in-sample vs. 0.464 leave-one-out (val 0.399, test 0.433).
+
+### 42.2 The ladder, and a design flaw caught mid-run
+
+Cumulative rungs, no basin inputs, 5 seeds each: R1 position/month (lat, lon sin/cos, doy sin/cos); R2 + SST and
+NCEP wind (`anc_sst`, `anc_spd`, `anc_dir`); R3 + brightness temperatures, TB bias adjustments, NEDT, geometry,
+land/ice, ascending (**no salinity field of any kind**); R4 + `anc_sss`; R5 + product byproducts (`smap_spd`,
+`smap_high_spd/dir/dir_smooth` -- from the joint SSS/wind solve, or fixed at `anc_sss`); R6 + `sat_sss` and
+`sat_smap_sss_uncertainty` (= all 35 inputs).
+
+**First version was flawed**: the network predicted Argo minus climatology but was never given the climatology as
+an input. Inputs carrying absolute salinity (brightness temperatures, `anc_sss`) then could not be turned into a
+departure from climatology without rebuilding the climatology from lat/month. Tell-tale: R4 scored 0.4045-0.4110
+while `anc_sss` used directly scores 0.3295, and even R6 (with `sat_sss`) scored 0.412 vs. 0.29 for the existing
+model on the same inputs. I stopped what looked like a stalled run to fix it; it had in fact already finished, so
+its full results exist (`ladder_tb_retrieval_results.parquet`, `ladder_v1_flawed.log`: R1 0.433, R2 0.428,
+R3 0.426, R4 0.408, R5 0.412, R6 0.412) and are **invalid**. Fix: the climatology value is an input at every rung.
+
+### 42.3 Ladder results (corrected; `ladder_tb_retrieval_results_v2.parquet`)
+
+| rung | inputs (incl. climatology) | test RMSE mean +/- std (min-max) |
+|---|---|---|
+| R0 | climatology alone, no network | 0.4327 |
+| R1 +position/month | 6 | 0.3892 +/- 0.0203 (0.3625-0.4133) |
+| R2 +SST/wind | 9 | 0.3626 +/- 0.0209 (0.3417-0.3913) |
+| R3 +brightness temps | 29 | 0.3338 +/- 0.0134 (0.3190-0.3489) |
+| R4 +`anc_sss` (HYCOM) | 30 | **0.2763 +/- 0.0052** (0.2729-0.2854) |
+| R5 +product byproducts | 34 | 0.2759 +/- 0.0017 (0.2737-0.2780) |
+| R6 +`sat_sss`, uncertainty | 36 | 0.2747 +/- 0.0037 (0.2717-0.2807) |
+
+- **Bypassing the product costs nothing**: R4 (no `sat_sss`, no uncertainty) and R6 (with both) differ by 0.0016,
+  inside the seed spread. Given brightness temperatures, ancillary fields and the climatology, the product's own
+  retrieval adds nothing detectable.
+- **The brightness temperatures carry modest signal**: R3 improves on R2 by ~0.029, but that is only ~1.5x the
+  seed spread of R1-R3 (+/-0.013 to +/-0.021), so suggestive rather than conclusive. R3 (no salinity field) only
+  reaches about HYCOM-alone level (0.334 vs. 0.330).
+- R1's gain over R0 (0.433 -> 0.389) is the network refining the coarse cell-mean climatology from position and
+  month, not new information; the real baseline for later rungs is R1.
+- `anc_sss` is the largest single step (R3 -> R4: -0.058).
+
+### 42.4 What actually made R6 beat the existing model (`climatology_input_test.py`)
+
+R6 beat the existing model by ~0.02, but differed in two ways at once (the climatology input, and the target
+Argo - climatology instead of Argo - `sat_sss`). Isolated, same split and seeds:
+
+| config | inputs | target | RMSE mean +/- std |
+|---|---|---|---|
+| C0 existing | 35 | Argo - `sat_sss` | 0.2965 +/- 0.0045 |
+| C1 + climatology input | 36 | Argo - `sat_sss` | **0.2838 +/- 0.0007** |
+| C2 (= ladder R6) | 36 | Argo - climatology | 0.2767 +/- 0.0063 |
+
+Seed-averaged predictions, paired row-bootstrap (positive = second is better): C0 - C1 +0.0100 (95% CI +0.0058 to
++0.0145); C1 - C2 +0.0067 (+0.0055 to +0.0080); C0 - C2 +0.0167 (+0.0120 to +0.0216). So roughly **60% of the gain
+is the climatology input and 40% the target definition**; the input also cuts seed-to-seed spread from 0.0045 to
+0.0007. C2 here (0.2767) differs from the ladder's R6 (0.2747) by 0.002 -- the same configuration with inputs in a
+different column order -- a feel for run-to-run noise at this level.
+
+### 42.5 Conclusions and caveats
+
+- Deriving salinity without the product is **feasible and not worse** (R4 ~ R6), provided `anc_sss` is available.
+  Without any salinity field (R3) it is about as good as HYCOM alone and clearly worse than with it.
+- The better numbers over the existing model come mainly from adding a train-years climatology to the model's
+  inputs, not from dropping `sat_sss`. This is a separate, cheap improvement (~0.01-0.02 PSU) for the deployed
+  model: the climatology is a small lookup table shipped with it (rebuildable from more years of Argo), and training
+  needs the leave-one-out version.
+- Caveats: 5 seeds; same split (train to 2023-12-31, test from 2024-03) as 40.3; R1-R3 seed spread is large;
+  HYCOM/Argo non-independence (41.4); single-pixel matchups, not footprint-averaged.
+- Not done here: a longer climatology (e.g. WOA) from outside the project's Argo. (The recent-data split and an
+  ensemble of the best configuration were tested afterwards, in 43.)
+
+Scripts new: `ladder_tb_retrieval.py`, `climatology_input_test.py`. Nothing committed.
+
+## 43. Combining the three improvements: recent data, a climatology input, and an ensemble
+
+41 found that more recent training data and seed-averaging help; 42 found that a train-years climatology (as an
+input, and as the baseline of the target) helps. This tests them together
+(`src/recent_climatology_ensemble.py`; per-seed results in `recent_climatology_ensemble_per_seed.parquet`,
+seed-averaged held-out predictions in `recent_climatology_ensemble_eval_predictions.parquet`).
+
+Setup: the 'recent' split of 41.1 (train <= 2025-09-30, 96,495 rows; validate 2025-10-01 to 2025-12-09, 3,415 rows),
+no basin inputs, 5 seeds per configuration, scored on the same untrained rows as 41.1 -- everything from
+2025-12-10: 'window' (to 2026-01-19, 1,961 rows) and 'later' (2026-01-20 on, 10,452 rows). The climatology is
+built from this split's train rows only (leave-one-out for train rows, as in 42.1).
+
+- **B0**: existing form (35 inputs, target Argo - `sat_sss`) -- 41's model B; reproduces 41 exactly (e.g. seed 4: 0.2614).
+- **B1**: + climatology as an input (36 inputs), same target.
+- **B2**: + climatology input, and target = Argo - climatology (36 inputs).
+
+References on the 12,413 rows (RMSE vs. Argo): raw `sat_sss` 0.9095; climatology alone 0.3610; **`anc_sss` (HYCOM)
+alone 0.2521**.
+
+### 43.1 Results (test RMSE, PSU; all untrained rows, n=12,413)
+
+| config | single network, mean +/- std (min-max), 5 seeds | seed-averaged ensemble |
+|---|---|---|
+| B0 existing form | 0.2604 +/- 0.0035 (0.2561-0.2656) | 0.2458 |
+| B1 + climatology input | 0.2536 +/- 0.0026 (0.2494-0.2567) | 0.2437 |
+| **B2 + climatology input + target-clim** | **0.2451 +/- 0.0011** (0.2438-0.2467) | **0.2365** |
+
+By subset (single networks mean; ensemble): window B0 0.2657 / 0.2549, B1 0.2595 / 0.2513, B2 0.2499 / 0.2437;
+later B0 0.2594 / 0.2441, B1 0.2524 / 0.2422, B2 0.2442 / 0.2351.
+
+Paired row-bootstrap on the ensembles (positive = second is better; 2,000 resamples), all rows:
+B0 - B1 +0.0021 (95% CI -0.0022 to +0.0070); B1 - B2 **+0.0072** (+0.0053 to +0.0091); B0 - B2 **+0.0094**
+(+0.0052 to +0.0144). On the window alone the intervals are too wide to separate any pair (B0 - B2: -0.0002 to
++0.0238), as in 41.1; the evidence for B2 comes from the later rows and the combined set.
+
+- **B2 is the best configuration on every subset.** A single B2 network (0.2451) matches the old five-network
+  average of B0 (0.2458).
+- **The target definition is the dependable gain**: B1 -> B2 is significant in every subset, ensembled or not. The
+  climatology input alone is clear for single networks (-0.007) but not significant once seeds are averaged.
+- **The gains overlap.** Seed-averaging improves B0 by 0.0146 but B2 by only 0.0086, because the climatology
+  changes already remove much of the seed-to-seed variance (std 0.0035 -> 0.0011).
+- Consistent with 42.4's split (climatology input vs. target) on the older split, though the proportions differ
+  (there ~60/40 input/target; here single networks gain 0.0068 from the input and 0.0085 from the target).
+
+### 43.2 The HYCOM comparison -- and a caution for the assimilation use
+
+On these rows `anc_sss` alone scores 0.2521 -- better than B0's single networks (0.2604), only 0.006 above its
+ensemble (0.2458), and 0.016 above B2's ensemble (0.2365). Almost all of the skill is in the HYCOM,
+climatology and brightness-temperature inputs; the product's own salinity adds little (42.3: R4 ~ R6).
+
+That bears on the purpose of the corrected files (assimilation into MOM6/the coupled model). If the corrected
+observations are largely HYCOM-informed, assimilating them feeds a model analysis back in as if it were an
+independent measurement, and HYCOM may itself assimilate Argo (general knowledge; not verified, 41.4). The
+observation-error values written into the IODA files would need to account for that. Raised as a design question to
+settle before using the files, not a conclusion.
+
+### 43.3 Not done
+
+- The IODA files have **not** been regenerated with B2. That needs real generator changes: computing the
+  climatology per observation (shipping the lookup table with the model) and writing climatology + network output
+  rather than `sat_sss` + a correction.
+- No checkpoint of the B2 ensemble was saved (the script trains and scores, and stores predictions only).
+- The climatology is from the project's own Argo; an external one (e.g. WOA) was not tried.
+
+Scripts new: `recent_climatology_ensemble.py`. Nothing committed.
+
+## 44. Like-for-like comparison of the three saved models; basin inputs retired
+
+The three saved checkpoints (`rich_correction_model.pt`, `rich_correction_model_nobasin.pt`,
+`rich_correction_ensemble_recent_nobasin.pt`) had been quoted with test numbers from **different row sets**: 0.293
+for the first (45,387 rows, 2024-03 onward) vs. 0.2458 for the ensemble (12,413 rows, 2025-12-10 onward), so the two
+were not comparable as quoted. They also differ in several ways at once (basin inputs, training end date, one network vs.
+five). All were therefore re-scored on the same untrained rows as 41.1 -- everything with `sat_datetime` >=
+2025-12-10 in the GDAC-direct matchup table (n=12,413: 'window' 1,961 to 2026-01-19, 'later' 10,452 after). None of
+the models saw these rows in training or validation. Raw `sat_sss` on them: 0.9095. Test RMSE in PSU:
+
+| model | training data | inputs | window | later | all |
+|---|---|---|---|---|---|
+| `rich_correction_model.pt` (single net, seed not fixed) | to 2023-12-31 | 41 (with basins) | 0.2859 | 0.2732 | **0.2753** |
+| `rich_correction_model_nobasin.pt` (single net, seed 0) | to 2023-12-31 | 35 | 0.2712 | 0.2745 | 0.2740 |
+| ensemble member, seed 0 | to 2025-09-30 | 35 | 0.2652 | 0.2577 | 0.2589 |
+| ensemble member, seed 1 | to 2025-09-30 | 35 | 0.2700 | 0.2648 | 0.2656 |
+| ensemble member, seed 2 | to 2025-09-30 | 35 | 0.2671 | 0.2587 | 0.2600 |
+| ensemble member, seed 3 | to 2025-09-30 | 35 | 0.2609 | 0.2551 | 0.2561 |
+| ensemble member, seed 4 | to 2025-09-30 | 35 | 0.2655 | 0.2607 | 0.2614 |
+| **ensemble mean of the 5** | to 2025-09-30 | 35 | 0.2549 | 0.2441 | **0.2458** |
+
+Mean of the five members as single networks: 0.2604 (all rows).
+
+- **With-basin vs. ensemble: 0.0294** (paired row-bootstrap, 2,000 resamples, 95% CI 0.0251 to 0.0339). Two parts of
+  about equal size: the step from the with-basin single net (0.2753) to a typical ensemble member (0.2604) is
+  ~0.015, and averaging the five members (0.2604 -> 0.2458) adds ~0.015. The first step mixes **more recent
+  training data** (to Sep 2025 vs. to Dec 2023) with dropping the basins; they are not separated by this table. [Update: 45 finds this step is almost entirely recency, not volume.] Against
+  member 0 alone (0.2589) the paired difference is 0.0164 (CI 0.0113 to 0.0217). (An earlier message split the
+  total as ~0.016 / ~0.013 using member 0 rather than the member mean; the member-mean split above is the fairer one.)
+- **Basin inputs at fixed training data**: 0.2753 (with basins) vs. 0.2740 (without) -- both trained to 2023, scored
+  identically. The 0.0013 gap is well inside the ~0.005 seed-to-seed spread (40.3), and one network had no fixed seed:
+  no detectable basin effect, consistent with 40.
+- **Caveat on the first IODA file set**: this table scores the with-basin model using basins from the matchup table
+  (the lat/lon classifier's, as trained). The files in `bias_corrected_obsForge/` were generated by feeding it
+  obsForge's own basin codes (40.2), which differ on ~10.7% of observations, so that file set's real performance may
+  be slightly worse than 0.2753. Not measured.
+
+### 44.1 Decision: no basin inputs in any future model
+
+The basin flags are not a native SMAP or Argo quantity. They are derived from lat/lon (`classify_ocean_basin.py`,
+~89% agreement with obsForge's codes) and were introduced after the fact to aid analysis of the early IODA-based
+results, not as model information (35, 40.2). 40.3 found no detectable benefit for the rich model and a train/inference
+mismatch risk, and this comparison again finds none at fixed training data. **From here on, models use the 35-input
+set without `basin_0..5`.** Results quoted in earlier sections that include basins are left as recorded.
+[Update: the script defaults that still included basins were flipped afterwards, see 44.2.]
+
+### 44.2 Script defaults flipped to no basins
+
+- `train_rich_features_poc.py`: `BASELINE_FEATURES` (now 6 inputs) and `RICH_FEATURES` (now 35) contain no basin
+  inputs. New `BASELINE_FEATURES_WITH_BASIN` (12) and `RICH_FEATURES_WITH_BASIN` (41) exist only for the basin
+  ablation and for reading checkpoints from before this rule. `add_features` builds the `basin_*` columns only when
+  `argo_oceanBasin` is present, and nothing in the default feature sets requires them.
+- `compare_basin_ablation.py`: the "with basin" configurations now use the explicit `*_WITH_BASIN` lists (it would
+  otherwise have silently become a no-basin vs. no-basin comparison); `drop_basin()` stays because other scripts
+  import it, and is now a no-op on the default lists.
+- `train_and_save_correction_model.py`: the `--no-basin` option is removed (always no-basin); the default output is now
+  `rich_correction_model_nobasin.pt`, so a default run can no longer overwrite the older with-basin
+  `rich_correction_model.pt`.
+- Affected by the flip without edits: `analyze_rich_feature_importance.py` (now 35 inputs) and
+  `test_training_window_sweep.py` (now the 6-input baseline). Anything that rereads their earlier results should
+  treat them as the basin-inclusive versions. `generate_bias_corrected_ioda.py` is unchanged: it still builds basin
+  columns from the original file's `oceanBasin` so it can read the older with-basin checkpoint; a no-basin checkpoint
+  simply ignores them. `train_baseline.py` and `features.py` belong to the older IODA-based pipeline and were not touched.
+
+Verification: `RICH_FEATURES_WITH_BASIN` equals the with-basin checkpoint's stored input list in order, and
+`RICH_FEATURES` equals the no-basin checkpoint's; row counts after the NaN drop are unchanged (112,323); all eleven
+dependent scripts import. Regression: the basin ablation rerun at seed 0 reproduces the earlier results exactly (rich
+with basins 0.2930, rich without 0.2939, baseline with 0.3416, baseline without 0.3631), written to `/tmp` so the saved
+ablation results were not overwritten. Nothing committed.
+
+## 45. More data, or more recent data? An equal-size test
+
+44 and 41.1 left a confound: the 'recent' model B differed from the old model A in both training-set size
+(96,495 vs. 63,620 rows) and training end date (2025-09-30 vs. 2023-12-31), so the gain from B could be volume,
+recency, or both. This separates them (`src/equal_size_recency_test.py`; per-seed results in
+`equal_size_recency_per_seed.parquet`, seed-averaged held-out predictions in
+`equal_size_recency_eval_predictions.parquet`).
+
+Three models, same 35 inputs (no basins), same target (Argo - `sat_sss`), same seeds 0-4, scored on the same
+untrained rows as 41.1 (everything with `sat_datetime` >= 2025-12-10: 12,413 rows; 'window' 1,961 to 2026-01-19,
+'later' 10,452 after):
+
+| model | training rows | training span | early-stopping validation |
+|---|---|---|---|
+| A (old split) | 63,620 | 2020-09-23 to 2023-12-30 | 3,316 rows, Dec 2023 - Feb 2024 |
+| B (recent split) | 96,495 | 2020-09-23 to 2025-09-29 | 3,415 rows, Oct - Dec 9 2025 |
+| **C (equal-size)** | **63,620** | **2022-04-11 to 2025-09-29** | 3,415 rows (same as B) |
+
+C is the most recent 63,620 rows before October 2025, a subset of B's training set with A's size. C vs. A holds size
+fixed and varies the period (isolates recency); C vs. B holds the end date fixed and varies size (isolates volume).
+A and B reproduced their 41.1 results exactly.
+
+### 45.1 Results (test RMSE, PSU)
+
+Single networks, mean +/- std (min-max) over 5 seeds:
+
+| held-out rows | A | B | C |
+|---|---|---|---|
+| window, n=1,961 | 0.2704 +/- 0.0029 (0.2654-0.2729) | 0.2657 +/- 0.0033 (0.2609-0.2700) | 0.2672 +/- 0.0043 (0.2622-0.2735) |
+| later, n=10,452 | 0.2758 +/- 0.0091 (0.2683-0.2916) | 0.2594 +/- 0.0036 (0.2551-0.2648) | 0.2591 +/- 0.0032 (0.2543-0.2627) |
+| all, n=12,413 | 0.2749 +/- 0.0078 (0.2690-0.2885) | 0.2604 +/- 0.0035 (0.2561-0.2656) | 0.2604 +/- 0.0033 (0.2556-0.2644) |
+
+Seed-averaged ensembles (RMSE): window A 0.2572 / B 0.2549 / C 0.2560; later A 0.2560 / B 0.2441 / C 0.2452;
+all A 0.2562 / B 0.2458 / C 0.2469. Paired row-bootstrap (2,000 resamples), positive = second is better:
+
+| subset | A - C (recency, size fixed) | C - B (size, end date fixed) | A - B (total) |
+|---|---|---|---|
+| window | +0.0013 (-0.0035, +0.0064) | +0.0011 (-0.0036, +0.0054) | +0.0025 (-0.0034, +0.0075) |
+| later | **+0.0110** (+0.0067, +0.0153) | +0.0011 (-0.0028, +0.0041) | +0.0121 (+0.0070, +0.0164) |
+| all | **+0.0093** (+0.0054, +0.0132) | +0.0010 (-0.0024, +0.0039) | +0.0104 (+0.0059, +0.0141) |
+
+- **Recency, not volume.** C matches B as single networks (0.2604 vs. 0.2604) despite 32,875 fewer training rows,
+  and C - B on the ensembles is +0.0010 with an interval spanning zero. C beats A at equal size by 0.0093
+  (interval +0.0054 to +0.0132). Of the 0.0104 total A - B gap on the ensembles, about 89% is the C - A step.
+- **Where it shows.** The effect is concentrated in the later rows (A - C: 0.0110) and not detectable in the
+  1,961-row window (0.0013, interval spanning zero) -- consistent with A going stale as the held-out period moves
+  away from its end date, though the window's small sample cannot confirm that. A is also less stable across seeds
+  (range 0.269-0.289 vs. about 0.256-0.265 for B and C).
+- This refines 44: its decomposition of the with-basin-single-to-ensemble gap attributed about half to the
+  recent training data; that half is now attributed to recency specifically.
+
+### 45.2 Caveats
+
+- **Early-stopping validation sets differ.** A stops on Dec 2023 - Feb 2024 rows; B and C stop on Oct - Dec 2025 rows,
+  just before the held-out period. Some of the "recency" gain could come from better-timed early stopping rather than
+  the training period. Not separated (giving A the recent validation set would peek past its training end).
+- Holds at 64k to 96k rows; it does not say more data is worthless beyond that range, only that it did not help here.
+- One training end date and one test period; the existing form of the model (target Argo - `sat_sss`), not the
+  climatology form of 43 (B2), where the recency effect might differ.
+- In direction this is consistent with 26.4's one non-monotonic origin (a 6-month window beating longer ones at the
+  newest origin), though that used the older range-filtered Argo labels and the baseline-feature model, so it is only
+  suggestive.
+
+### 45.3 Implication and not done
+
+For the deployed model the evidence favors retraining on a rolling recent window rather than accumulating older data.
+Not tested: other training end dates or window lengths (e.g. 12 vs. 24 months), recency weighting, and whether the
+recency effect holds for the climatology form (43). Scripts new: `equal_size_recency_test.py`. Nothing committed.
