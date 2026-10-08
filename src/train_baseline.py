@@ -54,7 +54,16 @@ def compute_metrics(pred, actual):
 
 
 def train_ffann(X_train, y_resid_train, X_val, y_resid_val, n_features,
-                 hidden=(32, 16), lr=1e-3, max_epochs=300, patience=20):
+                 hidden=(32, 16), lr=1e-3, max_epochs=2000, patience=50):
+    """max_epochs/patience raised from 300/20 (DESIGN.md 32): on a smaller
+    training set (e.g. the GDAC-QC-filtered matchup table, ~40% fewer rows
+    than the range-filtered ones), the rich-feature model's val_loss was
+    still improving at epoch 300 with no early stop, silently truncating
+    training and making it look worse than the baseline-feature model.
+    Early stopping already protects against wasted compute for models that
+    converge sooner, so raising the ceiling is safe for every existing
+    caller, not just this one.
+    """
     model = FFANN(n_features, hidden)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
