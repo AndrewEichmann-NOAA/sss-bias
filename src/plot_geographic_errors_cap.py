@@ -17,6 +17,8 @@ feature gain (DESIGN.md 25/26) is visible directly rather than only as an
 aggregate RMSE number.
 """
 
+import argparse
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -31,22 +33,35 @@ OUT_PATH = '/Users/afeman/Desktop/work/sss-bias/data/matchups/geo_errors_smap_ca
 
 
 def main():
-    full = pd.read_parquet(MATCHUPS_PATH, columns=['sat_lat', 'sat_lon', 'sat_sss', 'argo_salinity'])
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--matchups-path', default=MATCHUPS_PATH,
+                         help='Full matchup table for the "raw" panels (e.g. the GDAC-QC-filtered table, '
+                              'DESIGN.md 32).')
+    parser.add_argument('--predictions-path', default=PREDICTIONS_PATH)
+    parser.add_argument('--out', default=OUT_PATH)
+    parser.add_argument('--label', default='SMAP CAP', help='Dataset label for the figure title.')
+    parser.add_argument('--bin-deg', type=float, default=BIN_DEG)
+    parser.add_argument('--min-count', type=int, default=MIN_COUNT)
+    parser.add_argument('--bias-scale', type=float, default=None,
+                         help='Fixed +/- bias colorbar bound (PSU). Default: auto (95th percentile).')
+    args = parser.parse_args()
+
+    full = pd.read_parquet(args.matchups_path, columns=['sat_lat', 'sat_lon', 'sat_sss', 'argo_salinity'])
     raw_diff = (full['sat_sss'] - full['argo_salinity']).to_numpy()
     lon_e, lat_e, raw_rmse, raw_bias, _ = bin_stats(
-        full['sat_lat'].to_numpy(), full['sat_lon'].to_numpy(), raw_diff)
+        full['sat_lat'].to_numpy(), full['sat_lon'].to_numpy(), raw_diff, bin_deg=args.bin_deg, min_count=args.min_count)
 
-    test = pd.read_parquet(PREDICTIONS_PATH)
+    test = pd.read_parquet(args.predictions_path)
     baseline_diff = (test['pred_ffann_baseline'] - test['argo_salinity']).to_numpy()
     _, _, baseline_rmse, baseline_bias, _ = bin_stats(
-        test['sat_lat'].to_numpy(), test['sat_lon'].to_numpy(), baseline_diff)
+        test['sat_lat'].to_numpy(), test['sat_lon'].to_numpy(), baseline_diff, bin_deg=args.bin_deg, min_count=args.min_count)
     rich_diff = (test['pred_ffann_rich'] - test['argo_salinity']).to_numpy()
     _, _, rich_rmse, rich_bias, _ = bin_stats(
-        test['sat_lat'].to_numpy(), test['sat_lon'].to_numpy(), rich_diff)
+        test['sat_lat'].to_numpy(), test['sat_lon'].to_numpy(), rich_diff, bin_deg=args.bin_deg, min_count=args.min_count)
 
     all_bias = np.concatenate([g[~np.isnan(g)] for g in (raw_bias, baseline_bias, rich_bias)])
     all_rmse = np.concatenate([g[~np.isnan(g)] for g in (raw_rmse, baseline_rmse, rich_rmse)])
-    bias_scale = np.nanpercentile(np.abs(all_bias), 95)
+    bias_scale = args.bias_scale if args.bias_scale is not None else np.nanpercentile(np.abs(all_bias), 95)
     rmse_scale = np.nanpercentile(all_rmse, 95)
 
     fig, axes = plt.subplots(2, 3, figsize=(19, 8.5), sharex=True, sharey=True)
@@ -72,11 +87,11 @@ def main():
     for ax in axes[:, 0]:
         ax.set_ylabel('Latitude')
 
-    fig.suptitle(f'Raw JPL CAP SMAP vs. Argo bulk salinity: geographic error ({BIN_DEG:.0f}deg bins, '
-                 f'min {MIN_COUNT} obs/cell)', fontsize=12)
+    fig.suptitle(f'Raw JPL {args.label} vs. Argo bulk salinity: geographic error ({args.bin_deg:g}deg bins, '
+                 f'min {args.min_count} obs/cell)', fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(OUT_PATH, dpi=150)
-    print(f"Saved {OUT_PATH}")
+    fig.savefig(args.out, dpi=150)
+    print(f"Saved {args.out}")
 
 
 if __name__ == '__main__':
