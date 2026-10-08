@@ -2407,7 +2407,7 @@ B0 - B1 +0.0021 (95% CI -0.0022 to +0.0070); B1 - B2 **+0.0072** (+0.0053 to +0.
 (+0.0052 to +0.0144). On the window alone the intervals are too wide to separate any pair (B0 - B2: -0.0002 to
 +0.0238), as in 41.1; the evidence for B2 comes from the later rows and the combined set.
 
-- **B2 is the best configuration on every subset.** A single B2 network (0.2451) matches the old five-network
+- **B2 is the best configuration on every time subset** (not on the rows with the largest anomalies; see 46). A single B2 network (0.2451) matches the old five-network
   average of B0 (0.2458).
 - **The target definition is the dependable gain**: B1 -> B2 is significant in every subset, ensembled or not. The
   climatology input alone is clear for single networks (-0.007) but not significant once seeds are averaged.
@@ -2576,3 +2576,81 @@ all A 0.2562 / B 0.2458 / C 0.2469. Paired row-bootstrap (2,000 resamples), posi
 For the deployed model the evidence favors retraining on a rolling recent window rather than accumulating older data.
 Not tested: other training end dates or window lengths (e.g. 12 vs. 24 months), recency weighting, and whether the
 recency effect holds for the climatology form (43). Scripts new: `equal_size_recency_test.py`. Nothing committed.
+
+## 46. Does the 'Argo - climatology' target buy its gain by damping anomalies?
+
+Raised against 43: for a bias correction (target Argo - `sat_sss`) the B2 form (target Argo - climatology) changes what the
+product is, and a lower RMSE could be bought by pulling estimates toward the climatology, at the expense of real anomalies.
+`src/anomaly_preservation_check.py` (new; strata in `anomaly_preservation_strata.parquet`) tests this on the saved
+seed-averaged held-out predictions from 43 -- B0 (existing form), B1 (+ climatology input), B2 (+ input and target =
+Argo - climatology), 5 seeds each, on the 12,413 untrained rows from 2025-12-10. No retraining; the climatology is rebuilt
+from the same split's train rows and the saved predictions are checked to line up row for row (they do; ensemble RMSEs
+0.2458 / 0.2437 / 0.2365 reproduce 43).
+
+Held-out rows are stratified two ways. By the **true anomaly** (Argo - climatology): selects on the outcome, so any model that
+shrinks toward the mean looks worse in the extreme strata, partly by construction -- read the model-to-model differences, not
+the levels. By the **input anomaly** (`|anc_sss - clim|`, `|sat_sss - clim|`): selects only on inputs, so no selection bias.
+
+### 46.1 Results (ensemble RMSE, PSU; paired row-bootstrap, 2,000 resamples, 95% CI, "+" = second is better)
+
+| stratum | n | B0 | B1 | B2 | B0 - B2 | B1 - B2 |
+|---|---|---|---|---|---|---|
+| all rows | 12,413 | 0.2458 | 0.2437 | 0.2365 | +0.0093 (+0.0051, +0.0144) | +0.0072 (+0.0054, +0.0091) |
+| true \|anom\| lowest 50% | 6,207 | 0.1635 | 0.1276 | 0.1216 | +0.0419 (+0.0387, +0.0453) | +0.0061 (+0.0040, +0.0082) |
+| true \|anom\| 50-90% | 4,964 | 0.2230 | 0.2219 | 0.2148 | +0.0083 (+0.0035, +0.0137) | +0.0071 (+0.0050, +0.0092) |
+| true \|anom\| top 10% | 1,242 | **0.5212** | 0.5616 | 0.5484 | **-0.0273** (-0.0439, -0.0055) | +0.0132 (+0.0066, +0.0204) |
+| true anom lowest 5% (fresher) | 621 | 0.6357 | 0.6612 | 0.6495 | -0.0138 (-0.0404, +0.0200) | +0.0121 (+0.0020, +0.0227) |
+| true anom highest 5% (saltier) | 621 | **0.3704** | 0.4394 | 0.4219 | **-0.0517** (-0.0643, -0.0383) | +0.0176 (+0.0090, +0.0260) |
+| \|HYCOM anom\| top 10% | 1,242 | 0.4113 | 0.4260 | 0.4154 | -0.0046 (-0.0259, +0.0213) | +0.0108 (+0.0032, +0.0185) |
+| \|HYCOM anom\| bottom 90% | 11,171 | 0.2199 | 0.2140 | 0.2073 | +0.0126 (+0.0098, +0.0155) | +0.0068 (+0.0053, +0.0083) |
+| \|SMAP anom\| top 10% | 1,242 | 0.3339 | 0.3187 | **0.3019** | +0.0319 (+0.0181, +0.0474) | +0.0169 (+0.0090, +0.0244) |
+| \|SMAP anom\| bottom 90% | 11,171 | 0.2340 | 0.2339 | 0.2281 | +0.0059 (+0.0015, +0.0110) | +0.0058 (+0.0039, +0.0077) |
+
+B0 - B1 (not in the table): all rows +0.0021 (-0.0025, +0.0071); lowest 50% +0.0358; top 10% **-0.0405** (-0.0586, -0.0183);
+saltier 5% **-0.0692** (-0.0859, -0.0520); \|SMAP anom\| top 10% +0.0150 (+0.0004, +0.0303).
+
+Calibration -- OLS slope of the true anomaly on each model's predicted anomaly (1 = calibrated, > 1 = damped toward
+the climatology, < 1 = overspread) and the spread of the predicted anomaly (true anomaly std 0.361):
+
+| model | slope, all rows | slope, own top-10% of \|predicted anomaly\| | std of predicted anomaly |
+|---|---|---|---|
+| B0 | 0.892 | 0.911 | 0.298 |
+| B1 | 1.192 | 1.204 | 0.226 |
+| B2 | 1.156 | 1.145 | 0.238 |
+
+### 46.2 What this shows
+
+- **B2's gain over B1 is not damping.** B2 beats B1 in all ten strata with every interval excluding zero, including the
+  largest-anomaly rows (top 10%: +0.0132; both tails; large HYCOM and SMAP anomalies), and B2's predictions are *less*
+  damped than B1's (spread 0.238 vs. 0.226; slope 1.156 vs. 1.192). The target change helps across the board.
+- **The climatology *input* makes estimates more conservative, with a real cost at the extremes.** Both climatology-input models
+  are clearly worse than B0 on the largest true anomalies (top 10%: B0 0.521 vs. B1 0.562 / B2 0.548, significant; saltier tail
+  significant; fresher tail not) and have damped predictions (std 0.23-0.24 vs. 0.30; slopes > 1), while being much better on
+  the ordinary rows (lowest 50%: 0.164 -> 0.128 / 0.122). The aggregate gain comes from the many ordinary rows. Caveat: the
+  true-anomaly strata favor the less-shrunk B0 by construction.
+- **Where inputs themselves signal a large anomaly there is no such loss.** On rows with a large SMAP-vs-climatology anomaly,
+  B2 is the best (0.302 vs. B0 0.334); on rows with a large HYCOM anomaly B2 and B0 cannot be separated (-0.0046, interval
+  spanning zero), and both beat B1.
+- **Calibration**: B1 and B2 are under-dispersed (a 15-20% stretch of their predicted anomalies would lower MSE on these
+  rows); B0 is slightly over-dispersed (0.89). Caveats: seed-averaging itself shrinks prediction spread, and the held-out
+  rows are later than the training period, so a shift toward larger anomalies would also push the slope above 1. No
+  recalibration was tried.
+
+### 46.3 Consequence for the bias-correction form
+
+My earlier recommendation (in conversation, after 43) was B1 -- target Argo - `sat_sss` with the climatology added as an
+input -- as the form consistent with a bias correction. This test does not support it: B1's gain over B0 is not significant
+in aggregate for ensembles (+0.0021), and it costs accuracy on the largest anomalies (-0.0405, significant) that matter
+most for events. **For a strict bias correction, the B0 form (Argo - `sat_sss`, no climatology input) preserves large anomalies
+best**, which is the form of the ensemble IODA files of 41.2 (`rich_correction_ensemble_recent_nobasin.pt`). B2 gives the
+lowest overall RMSE and does not lose where the inputs themselves signal a large anomaly, but it is a different product
+(a salinity estimate that uses SMAP), carries the conservative-estimate cost on the most anomalous rows, and shares the
+HYCOM-dependence concern of 43.2.
+
+### 46.4 Not done
+
+- A recalibration/stretch of the damped models, and an extreme-weighted loss.
+- Regional breakdown of the extreme rows; tests on any other held-out period.
+- Comparing the forms on observations of known events (e.g. a river plume or ENSO excursion) rather than quantile strata.
+
+Scripts new: `anomaly_preservation_check.py`. Nothing committed.
